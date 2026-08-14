@@ -1,0 +1,5 @@
+{
+  "ListenPort": 7000,
+  "ForwardIp": "127.0.0.1",
+  "ForwardPort": 7001
+}
