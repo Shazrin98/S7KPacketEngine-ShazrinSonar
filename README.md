@@ -1,15 +1,15 @@
 To get started on installing this:
 
 1. Open Command Prompt or PowerShell on Windows, and run these two commands:
-/
-winget install Microsoft.DotNet.SDK.8
+//
+winget install Microsoft.DotNet.SDK.8 //
 winget install Git.Git
-/
+//
 3. Follow the on-screen prompts until finished with the installation.
 4. Close your current Command Prompt window and any open VS Code windows completely, then open a fresh Command Prompt window.
 5. To ensure installation, open a new Command Prompt window, run:
-/
-dotnet --list-sdks
+//
+dotnet --list-sdks //
 git --version
-/
+//
 6. You should see .NET SDK 8.x.xxx listed along with the installed Git version.
