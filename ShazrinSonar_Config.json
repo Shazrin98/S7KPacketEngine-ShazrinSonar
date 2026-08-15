@@ -1,5 +1,6 @@
 {
-  "ListenPort": 7000,
-  "ForwardIp": "127.0.0.1",
-  "ForwardPort": 7001
+  "SourceIp": "127.0.0.1",
+  "SourcePort": 7000,
+  "TargetProtocol": "TCP",
+  "TargetPort": 7001
 }
