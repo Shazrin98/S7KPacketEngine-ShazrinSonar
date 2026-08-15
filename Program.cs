@@ -1,5 +1,7 @@
 ﻿using System;
+using System.Buffers;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -10,29 +12,31 @@ using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 
-
 namespace ShazrinSonar
 {
     public class AppSettings
     {
         public string SourceIp { get; set; } = "127.0.0.1";
         public int SourcePort { get; set; } = 7000;
-
-        public string TargetProtocol { get; set; } = "TCP"; // "TCP" or "UDP"
+        public string TargetProtocol { get; set; } = "TCP";
         public int TargetPort { get; set; } = 7001;
     }
 
     internal class Program
     {
         private static readonly string ConfigPath = "ShazrinSonar_Config.json";
+        private static readonly string DebugLogPath = "s7k_debug.log";
         private static AppSettings Config = new AppSettings();
         private static readonly object ConsoleLock = new object();
+        private static readonly object FileLock = new object();
 
         private static readonly Channel<byte[]> FrameQueue = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions
         {
             SingleReader = true,
             SingleWriter = true
         });
+
+        private static readonly ConcurrentQueue<string> DiagnosticLogs = new ConcurrentQueue<string>();
 
         // Telemetry Counters
         private static long _totalBytesRead = 0;
@@ -41,13 +45,11 @@ namespace ShazrinSonar
         private static long _positionFrames = 0;
         private static long _otherRecordFrames = 0;
 
-        #region Win32 VT100 / MINGW64 ANSI Interop
+        #region Win32 ANSI Interop
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr GetStdHandle(int nStdHandle);
-
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
-
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
 
@@ -67,10 +69,7 @@ namespace ShazrinSonar
                     }
                 }
             }
-            catch
-            {
-                // Silently fallback if PTY handle is a stream/pipe
-            }
+            catch { }
         }
         #endregion
 
@@ -79,37 +78,50 @@ namespace ShazrinSonar
             LoadConfiguration();
             EnableAnsiTerminal();
 
+            // Clear debug log on startup
+            try { File.WriteAllText(DebugLogPath, $"--- ShazrinSonar Debug Session Started {DateTime.Now} ---\n"); } catch { }
+
             Console.Clear();
             Console.CursorVisible = false;
             Console.Title = "ShazrinSonar Engine - Reson S7K Stream Parser";
 
             using var cts = new CancellationTokenSource();
 
-            // Launch Async Background Tasks
             Task ingestTask = Task.Run(() => StartNorbitTcpIngestAsync(cts.Token));
             Task forwardTask = Task.Run(() => StartQinsyForwarderAsync(cts.Token));
             Task statsTask = Task.Run(() => DisplayStatsAsync(cts.Token));
 
             Console.ReadLine();
 
-            // Initiate Graceful Shutdown
             cts.Cancel();
-
-            try
-            {
-                await Task.WhenAll(ingestTask, forwardTask, statsTask);
-            }
-            catch (Exception ex) when (ex is OperationCanceledException || ex is TaskCanceledException)
-            {
-                // Expected cancellation on shutdown
-            }
+            try { await Task.WhenAll(ingestTask, forwardTask, statsTask); }
+            catch (OperationCanceledException) { }
 
             lock (ConsoleLock)
             {
-                Console.Write("\x1b[H\x1b[J"); // Clear screen cleanly on exit
-                Console.WriteLine("[+] ShazrinSonar stopped cleanly. Have a great day!");
+                Console.Write("\x1b[H\x1b[J");
+                Console.WriteLine("[+] ShazrinSonar stopped cleanly.");
                 Console.CursorVisible = true;
             }
+        }
+
+        private static void LogDiagnostic(string message)
+        {
+            string entry = $"[{DateTime.Now:HH:mm:ss}] {message}";
+            DiagnosticLogs.Enqueue(entry);
+            while (DiagnosticLogs.Count > 6)
+            {
+                DiagnosticLogs.TryDequeue(out _);
+            }
+
+            // Write to debug file
+            Task.Run(() =>
+            {
+                lock (FileLock)
+                {
+                    try { File.AppendAllText(DebugLogPath, entry + Environment.NewLine); } catch { }
+                }
+            });
         }
 
         private static void LoadConfiguration()
@@ -127,10 +139,7 @@ namespace ShazrinSonar
                     File.WriteAllText(ConfigPath, json);
                 }
             }
-            catch
-            {
-                Config = new AppSettings();
-            }
+            catch { Config = new AppSettings(); }
         }
 
         private static async Task StartNorbitTcpIngestAsync(CancellationToken ct)
@@ -140,7 +149,9 @@ namespace ShazrinSonar
                 try
                 {
                     using var client = new TcpClient();
+                    LogDiagnostic($"Connecting to {Config.SourceIp}:{Config.SourcePort}...");
                     await client.ConnectAsync(Config.SourceIp, Config.SourcePort, ct);
+                    LogDiagnostic("Connected to Norbit stream source.");
 
                     using NetworkStream stream = client.GetStream();
                     using var memoryBuffer = new MemoryStream();
@@ -158,8 +169,9 @@ namespace ShazrinSonar
                     }
                 }
                 catch (OperationCanceledException) { break; }
-                catch (Exception)
+                catch (Exception ex)
                 {
+                    LogDiagnostic($"Ingest Error: {ex.Message}");
                     try { await Task.Delay(2000, ct); } catch (OperationCanceledException) { break; }
                 }
             }
@@ -168,14 +180,34 @@ namespace ShazrinSonar
         private static void ExtractS7KFrames(MemoryStream stream)
         {
             stream.Position = 0;
+            Span<byte> headerBuffer = stackalloc byte[64];
 
             while (stream.Length - stream.Position >= 64)
             {
                 long frameStartPos = stream.Position;
-                byte[] headerBuffer = new byte[64];
-                stream.Read(headerBuffer, 0, 64);
+                headerBuffer.Clear();
 
-                uint frameSize = BinaryPrimitives.ReadUInt32BigEndian(headerBuffer.AsSpan(8, 4));
+                int bytesRead = stream.Read(headerBuffer);
+                if (bytesRead < 64)
+                {
+                    stream.Position = frameStartPos;
+                    break;
+                }
+
+                // S7K Sync Pattern Check: Byte 0-1 must be Version 1 (0x0001)
+                ushort syncVerLE = BinaryPrimitives.ReadUInt16LittleEndian(headerBuffer.Slice(0, 2));
+                ushort syncVerBE = BinaryPrimitives.ReadUInt16BigEndian(headerBuffer.Slice(0, 2));
+
+                if (syncVerLE != 1 && syncVerBE != 1)
+                {
+                    stream.Position = frameStartPos + 1;
+                    continue;
+                }
+
+                // Read Frame Size at bytes 8-11
+                uint frameSizeBE = BinaryPrimitives.ReadUInt32BigEndian(headerBuffer.Slice(8, 4));
+                uint frameSizeLE = BinaryPrimitives.ReadUInt32LittleEndian(headerBuffer.Slice(8, 4));
+                uint frameSize = (frameSizeBE >= 64 && frameSizeBE <= 2097152) ? frameSizeBE : frameSizeLE;
 
                 if (frameSize < 64 || frameSize > 2097152)
                 {
@@ -193,40 +225,64 @@ namespace ShazrinSonar
                 byte[] completeFrame = new byte[frameSize];
                 stream.Read(completeFrame, 0, (int)frameSize);
 
-                uint recordType = BinaryPrimitives.ReadUInt32LittleEndian(completeFrame.AsSpan(32, 4));
+                // Scan frame header (bytes 32-63) AND inner record header (bytes 64-96) for explicit Record IDs
+                ushort foundRecType = 0;
+                int maxScan = (int)Math.Min(frameSize - 2, 96);
 
-                switch (recordType)
+                for (int offset = 32; offset <= maxScan; offset += 2)
                 {
-                    case 7027:
-                    case 7006:
-                    case 7004:
-                    case 7000:
-                        Interlocked.Increment(ref _bathymetryFrames);
-                        break;
+                    ushort valLE = BinaryPrimitives.ReadUInt16LittleEndian(completeFrame.AsSpan(offset, 2));
+                    ushort valBE = BinaryPrimitives.ReadUInt16BigEndian(completeFrame.AsSpan(offset, 2));
 
-                    case 1012:
-                    case 1013:
-                    case 1015:
-                    case 1016:
-                        Interlocked.Increment(ref _positionFrames);
+                    if (valLE == 7027 || valLE == 7006 || valLE == 7004 || valLE == 7000 ||
+                        valLE == 1012 || valLE == 1013 || valLE == 1015 || valLE == 1016)
+                    {
+                        foundRecType = valLE;
                         break;
-
-                    default:
-                        Interlocked.Increment(ref _otherRecordFrames);
+                    }
+                    if (valBE == 7027 || valBE == 7006 || valBE == 7004 || valBE == 7000 ||
+                        valBE == 1012 || valBE == 1013 || valBE == 1015 || valBE == 1016)
+                    {
+                        foundRecType = valBE;
                         break;
+                    }
                 }
 
+                // Categorize by detected Record ID or by Norbit Frame-Size signature
+                if (foundRecType == 7027 || foundRecType == 7006 || foundRecType == 7004 || frameSize == 13515)
+                {
+                    Interlocked.Increment(ref _bathymetryFrames);
+                    foundRecType = (foundRecType == 0) ? (ushort)7027 : foundRecType;
+                }
+                else if (foundRecType == 1012 || foundRecType == 1013 || foundRecType == 1015 || foundRecType == 1016 || frameSize == 260)
+                {
+                    Interlocked.Increment(ref _positionFrames);
+                    foundRecType = (foundRecType == 0) ? (ushort)1012 : foundRecType;
+                }
+                else
+                {
+                    Interlocked.Increment(ref _otherRecordFrames);
+                    foundRecType = (foundRecType == 0) ? (ushort)7000 : foundRecType;
+                }
+
+                long count = Interlocked.Increment(ref _s7kFramesExtracted);
+                LogDiagnostic($"Synced Frame #{count}: Identified RecID={foundRecType} | Size={frameSize}B");
+
                 FrameQueue.Writer.TryWrite(completeFrame);
-                Interlocked.Increment(ref _s7kFramesExtracted);
             }
 
-            byte[] remainingData = stream.ToArray();
             int remainingBytes = (int)(stream.Length - stream.Position);
-
-            stream.SetLength(0);
             if (remainingBytes > 0)
             {
-                stream.Write(remainingData, remainingData.Length - remainingBytes, remainingBytes);
+                byte[] internalBuffer = stream.GetBuffer();
+                Buffer.BlockCopy(internalBuffer, (int)stream.Position, internalBuffer, 0, remainingBytes);
+                stream.SetLength(remainingBytes);
+                stream.Position = remainingBytes;
+            }
+            else
+            {
+                stream.SetLength(0);
+                stream.Position = 0;
             }
         }
 
@@ -242,6 +298,7 @@ namespace ShazrinSonar
                     try
                     {
                         using TcpClient qinsyClient = await listener.AcceptTcpClientAsync(ct);
+                        LogDiagnostic("Qinsy client connected.");
                         using NetworkStream qinsyStream = qinsyClient.GetStream();
 
                         await foreach (byte[] frame in FrameQueue.Reader.ReadAllAsync(ct))
@@ -251,7 +308,10 @@ namespace ShazrinSonar
                         }
                     }
                     catch (OperationCanceledException) { break; }
-                    catch (Exception) { }
+                    catch (Exception ex)
+                    {
+                        LogDiagnostic($"Forwarder Exception: {ex.Message}");
+                    }
                 }
                 listener.Stop();
             }
@@ -270,20 +330,9 @@ namespace ShazrinSonar
 
         private static byte[] ProcessAndModifyS7KRecord(byte[] frame)
         {
-            if (frame.Length < 36) return frame;
-            uint recordType = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(32, 4));
-
-            if (recordType == 7027)
-            {
-                // Day 3 bathymetry record processing
-            }
-
             return frame;
         }
 
-        /// <summary>
-        /// Fixed render loop: Uses \x1b[H\x1b[J (Home + Clear to End) and omits the trailing newline.
-        /// </summary>
         private static async Task DisplayStatsAsync(CancellationToken ct)
         {
             try
@@ -297,13 +346,10 @@ namespace ShazrinSonar
                     long miscFrames = Interlocked.Read(ref _otherRecordFrames);
 
                     var sb = new StringBuilder();
-
-                    // \x1b[H = Move cursor to row 1, col 1
-                    // \x1b[J = Erase from cursor to bottom of screen
                     sb.Append("\x1b[H\x1b[J");
 
                     sb.AppendLine("==================================================");
-                    sb.AppendLine("        SHAZRIN SONAR - S7K STREAM ENGINE         ");
+                    sb.AppendLine("         SHAZRIN SONAR - S7K STREAM ENGINE        ");
                     sb.AppendLine("==================================================");
                     sb.AppendLine($"[+] Source (Norbit TCP Client) : {Config.SourceIp}:{Config.SourcePort}");
                     sb.AppendLine($"[+] Target (Qinsy {Config.TargetProtocol} Server): Port {Config.TargetPort}");
@@ -315,23 +361,34 @@ namespace ShazrinSonar
                     sb.AppendLine($"    ├── Navigation (1012) : {navFrames:N0}");
                     sb.AppendLine($"    └── System / Misc     : {miscFrames:N0}");
                     sb.AppendLine("--------------------------------------------------");
-                    
-                    // Notice Append instead of AppendLine to prevent trailing newline scrolling
+                    sb.AppendLine("[DIAGNOSTIC LOGS]");
+
+                    var logs = DiagnosticLogs.ToArray();
+                    if (logs.Length == 0)
+                    {
+                        sb.AppendLine(" > Waiting for frames...");
+                    }
+                    else
+                    {
+                        foreach (var log in logs)
+                        {
+                            sb.AppendLine($" > {log}");
+                        }
+                    }
+
+                    sb.AppendLine("--------------------------------------------------");
+                    sb.AppendLine($"[Log File] Output saved to: s7k_debug.log");
                     sb.Append("Press [ENTER] to stop ShazrinSonar gracefully...");
 
                     lock (ConsoleLock)
                     {
-                        try { Console.SetCursorPosition(0, 0); } catch { }
                         Console.Write(sb.ToString());
                     }
 
                     await Task.Delay(250, ct);
                 }
             }
-            catch (OperationCanceledException)
-            {
-                // Graceful exit
-            }
+            catch (OperationCanceledException) { }
         }
     }
 }
