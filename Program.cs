@@ -3,10 +3,13 @@ using System.Buffers.Binary;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+
 
 namespace ShazrinSonar
 {
@@ -25,7 +28,6 @@ namespace ShazrinSonar
         private static AppSettings Config = new AppSettings();
         private static readonly object ConsoleLock = new object();
 
-        // High-performance channel passing decoupled S7K binary frames to the Qinsy outbound engine
         private static readonly Channel<byte[]> FrameQueue = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions
         {
             SingleReader = true,
@@ -39,25 +41,47 @@ namespace ShazrinSonar
         private static long _positionFrames = 0;
         private static long _otherRecordFrames = 0;
 
+        #region Win32 VT100 / MINGW64 ANSI Interop
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GetStdHandle(int nStdHandle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+
+        private const int STD_OUTPUT_HANDLE = -11;
+        private const uint ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
+
+        private static void EnableAnsiTerminal()
+        {
+            try
+            {
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    IntPtr handle = GetStdHandle(STD_OUTPUT_HANDLE);
+                    if (GetConsoleMode(handle, out uint mode))
+                    {
+                        SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+                    }
+                }
+            }
+            catch
+            {
+                // Silently fallback if PTY handle is a stream/pipe
+            }
+        }
+        #endregion
+
         static async Task Main(string[] args)
         {
             LoadConfiguration();
+            EnableAnsiTerminal();
 
             Console.Clear();
             Console.CursorVisible = false;
             Console.Title = "ShazrinSonar Engine - Reson S7K Stream Parser";
-
-            lock (ConsoleLock)
-            {
-                Console.WriteLine("==================================================");
-                Console.WriteLine("        SHAZRIN SONAR - S7K STREAM ENGINE         ");
-                Console.WriteLine("==================================================");
-                Console.WriteLine($"[+] Source (Norbit TCP Client) : {Config.SourceIp}:{Config.SourcePort}");
-                Console.WriteLine($"[+] Target (Qinsy {Config.TargetProtocol} Server): Port {Config.TargetPort}");
-                Console.WriteLine("--------------------------------------------------");
-                Console.WriteLine("\n\n\n\n\n\n");
-                Console.WriteLine("Press [ENTER] to stop ShazrinSonar gracefully...\n");
-            }
 
             using var cts = new CancellationTokenSource();
 
@@ -82,8 +106,8 @@ namespace ShazrinSonar
 
             lock (ConsoleLock)
             {
-                SafeSetCursorPosition(0, 16);
-                Console.WriteLine("[+] ShazrinSonar stopped cleanly. Have a great day!          ");
+                Console.Write("\x1b[H\x1b[J"); // Clear screen cleanly on exit
+                Console.WriteLine("[+] ShazrinSonar stopped cleanly. Have a great day!");
                 Console.CursorVisible = true;
             }
         }
@@ -109,9 +133,6 @@ namespace ShazrinSonar
             }
         }
 
-        /// <summary>
-        /// Task 1: Connects to Norbit TCP Server and reads incoming byte stream.
-        /// </summary>
         private static async Task StartNorbitTcpIngestAsync(CancellationToken ct)
         {
             while (!ct.IsCancellationRequested)
@@ -123,17 +144,16 @@ namespace ShazrinSonar
 
                     using NetworkStream stream = client.GetStream();
                     using var memoryBuffer = new MemoryStream();
-                    byte[] readBuffer = new byte[32768]; // 32KB buffer
+                    byte[] readBuffer = new byte[32768];
 
                     while (!ct.IsCancellationRequested && client.Connected)
                     {
                         int bytesRead = await stream.ReadAsync(readBuffer, 0, readBuffer.Length, ct);
-                        if (bytesRead == 0) break; // Reconnect if server closes connection
+                        if (bytesRead == 0) break;
 
                         Interlocked.Add(ref _totalBytesRead, bytesRead);
                         memoryBuffer.Write(readBuffer, 0, bytesRead);
 
-                        // Decouple full S7K binary frames out of continuous TCP memory stream
                         ExtractS7KFrames(memoryBuffer);
                     }
                 }
@@ -145,61 +165,49 @@ namespace ShazrinSonar
             }
         }
 
-        /// <summary>
-        /// Carves continuous TCP stream into individual Reson S7K records using Big-Endian frame headers
-        /// and Little-Endian record IDs.
-        /// </summary>
         private static void ExtractS7KFrames(MemoryStream stream)
         {
             stream.Position = 0;
 
-            // Minimum full header requirement: 32 bytes Data Frame Header + 4 bytes Data Record Header ID
             while (stream.Length - stream.Position >= 64)
             {
                 long frameStartPos = stream.Position;
                 byte[] headerBuffer = new byte[64];
                 stream.Read(headerBuffer, 0, 64);
 
-                // Read Total Frame Size (Bytes 8-11, Big-Endian / Network Byte Order)
                 uint frameSize = BinaryPrimitives.ReadUInt32BigEndian(headerBuffer.AsSpan(8, 4));
 
-                // Sanity check frame size boundaries (S7K records: 64 bytes to 2MB)
                 if (frameSize < 64 || frameSize > 2097152)
                 {
-                    // Unaligned byte stream: advance cursor by 1 byte to seek next valid header
                     stream.Position = frameStartPos + 1;
                     continue;
                 }
 
-                // Wait if the full frame record payload has not completely arrived in the buffer yet
                 if (stream.Length - frameStartPos < frameSize)
                 {
-                    stream.Position = frameStartPos; // Rewind and await next TCP read
+                    stream.Position = frameStartPos;
                     break;
                 }
 
-                // Slice the complete S7K record
                 stream.Position = frameStartPos;
                 byte[] completeFrame = new byte[frameSize];
                 stream.Read(completeFrame, 0, (int)frameSize);
 
-                // Read Record Type ID (Bytes 32-35) strictly in Little-Endian format
                 uint recordType = BinaryPrimitives.ReadUInt32LittleEndian(completeFrame.AsSpan(32, 4));
 
-                // Classify S7K Record Types
                 switch (recordType)
                 {
-                    case 7027: // Raw Detection Data / Bathymetric Depths
-                    case 7006: // Compressed Bathymetry
-                    case 7004: // Beam Geometry / Bathymetry Setup
-                    case 7000: // Sonar Settings
+                    case 7027:
+                    case 7006:
+                    case 7004:
+                    case 7000:
                         Interlocked.Increment(ref _bathymetryFrames);
                         break;
 
-                    case 1012: // Roll, Pitch, Heave & Position
-                    case 1013: // Position / GPS Data
-                    case 1015: // Navigation / Position Record
-                    case 1016: // Motion / Attitude Record
+                    case 1012:
+                    case 1013:
+                    case 1015:
+                    case 1016:
                         Interlocked.Increment(ref _positionFrames);
                         break;
 
@@ -208,12 +216,10 @@ namespace ShazrinSonar
                         break;
                 }
 
-                // Forward full frame to Qinsy dispatch queue
                 FrameQueue.Writer.TryWrite(completeFrame);
                 Interlocked.Increment(ref _s7kFramesExtracted);
             }
 
-            // Compact unprocessed partial trailing bytes back to the start of the stream
             byte[] remainingData = stream.ToArray();
             int remainingBytes = (int)(stream.Length - stream.Position);
 
@@ -224,9 +230,6 @@ namespace ShazrinSonar
             }
         }
 
-        /// <summary>
-        /// Task 2: Forwards raw or modified S7K records to Qinsy over TCP or UDP.
-        /// </summary>
         private static async Task StartQinsyForwarderAsync(CancellationToken ct)
         {
             if (Config.TargetProtocol.Equals("TCP", StringComparison.OrdinalIgnoreCase))
@@ -248,7 +251,7 @@ namespace ShazrinSonar
                         }
                     }
                     catch (OperationCanceledException) { break; }
-                    catch (Exception) { /* Handle client disconnect/reconnect */ }
+                    catch (Exception) { }
                 }
                 listener.Stop();
             }
@@ -265,45 +268,21 @@ namespace ShazrinSonar
             }
         }
 
-        /// <summary>
-        /// Day 3 Pipeline Hook: Inspects and modifies binary payload records (e.g., Record 7027 depth adjustments).
-        /// </summary>
         private static byte[] ProcessAndModifyS7KRecord(byte[] frame)
         {
             if (frame.Length < 36) return frame;
-
-            // Extract Record Type ID at offset 32 (Little-Endian)
             uint recordType = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(32, 4));
 
             if (recordType == 7027)
             {
-                // Day 3 Logic: Intercept Record 7027 bathymetry detection data arrays here
+                // Day 3 bathymetry record processing
             }
 
             return frame;
         }
 
         /// <summary>
-        /// Safe terminal cursor positioning compatible with Windows CMD, PowerShell, and MINGW64/Git Bash.
-        /// </summary>
-        private static void SafeSetCursorPosition(int left, int top)
-        {
-            try
-            {
-                int maxLeft = Math.Max(0, Console.WindowWidth - 1);
-                int maxTop = Math.Max(0, Console.WindowHeight - 1);
-
-                Console.SetCursorPosition(Math.Clamp(left, 0, maxLeft), Math.Clamp(top, 0, maxTop));
-            }
-            catch
-            {
-                // Fallback for MINGW64 / Git Bash PTY environments using VT100 ANSI sequences
-                Console.Write($"\x1b[{top + 1};{left + 1}H");
-            }
-        }
-
-        /// <summary>
-        /// Thread-safe console rendering loop.
+        /// Fixed render loop: Uses \x1b[H\x1b[J (Home + Clear to End) and omits the trailing newline.
         /// </summary>
         private static async Task DisplayStatsAsync(CancellationToken ct)
         {
@@ -311,16 +290,39 @@ namespace ShazrinSonar
             {
                 while (!ct.IsCancellationRequested)
                 {
+                    double mbIngested = Interlocked.Read(ref _totalBytesRead) / 1024.0 / 1024.0;
+                    long totalFrames = Interlocked.Read(ref _s7kFramesExtracted);
+                    long bathyFrames = Interlocked.Read(ref _bathymetryFrames);
+                    long navFrames = Interlocked.Read(ref _positionFrames);
+                    long miscFrames = Interlocked.Read(ref _otherRecordFrames);
+
+                    var sb = new StringBuilder();
+
+                    // \x1b[H = Move cursor to row 1, col 1
+                    // \x1b[J = Erase from cursor to bottom of screen
+                    sb.Append("\x1b[H\x1b[J");
+
+                    sb.AppendLine("==================================================");
+                    sb.AppendLine("        SHAZRIN SONAR - S7K STREAM ENGINE         ");
+                    sb.AppendLine("==================================================");
+                    sb.AppendLine($"[+] Source (Norbit TCP Client) : {Config.SourceIp}:{Config.SourcePort}");
+                    sb.AppendLine($"[+] Target (Qinsy {Config.TargetProtocol} Server): Port {Config.TargetPort}");
+                    sb.AppendLine("--------------------------------------------------");
+                    sb.AppendLine($"[+] Stream Status         : ACTIVE");
+                    sb.AppendLine($"[+] Raw Ingested Data     : {mbIngested:F2} MB");
+                    sb.AppendLine($"[+] S7K Records Extracted : {totalFrames:N0}");
+                    sb.AppendLine($"    ├── Bathymetry (7027) : {bathyFrames:N0}");
+                    sb.AppendLine($"    ├── Navigation (1012) : {navFrames:N0}");
+                    sb.AppendLine($"    └── System / Misc     : {miscFrames:N0}");
+                    sb.AppendLine("--------------------------------------------------");
+                    
+                    // Notice Append instead of AppendLine to prevent trailing newline scrolling
+                    sb.Append("Press [ENTER] to stop ShazrinSonar gracefully...");
+
                     lock (ConsoleLock)
                     {
-                        SafeSetCursorPosition(0, 7);
-                        Console.WriteLine($"[+] Stream Status         : ACTIVE                               ");
-                        Console.WriteLine($"[+] Raw Ingested Data     : {Interlocked.Read(ref _totalBytesRead) / 1024.0 / 1024.0:F2} MB                  ");
-                        Console.WriteLine($"[+] S7K Records Extracted : {Interlocked.Read(ref _s7kFramesExtracted):N0}                      ");
-                        Console.WriteLine($"    ├── Bathymetry (7027) : {Interlocked.Read(ref _bathymetryFrames):N0}                      ");
-                        Console.WriteLine($"    ├── Navigation (1012) : {Interlocked.Read(ref _positionFrames):N0}                      ");
-                        Console.WriteLine($"    └── System / Misc     : {Interlocked.Read(ref _otherRecordFrames):N0}                      ");
-                        Console.WriteLine("--------------------------------------------------");
+                        try { Console.SetCursorPosition(0, 0); } catch { }
+                        Console.Write(sb.ToString());
                     }
 
                     await Task.Delay(250, ct);
