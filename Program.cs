@@ -45,6 +45,11 @@ namespace ShazrinSonar
         private static long _positionFrames = 0;
         private static long _otherRecordFrames = 0;
 
+        // Active Record 7027 Telemetry
+        private static uint _lastPingNumber = 0;
+        private static uint _lastBeamCount = 0;
+        private static ushort _lastSonarSerialNumber = 0;
+
         #region Win32 ANSI Interop
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr GetStdHandle(int nStdHandle);
@@ -78,7 +83,6 @@ namespace ShazrinSonar
             LoadConfiguration();
             EnableAnsiTerminal();
 
-            // Clear debug log on startup
             try { File.WriteAllText(DebugLogPath, $"--- ShazrinSonar Debug Session Started {DateTime.Now} ---\n"); } catch { }
 
             Console.Clear();
@@ -114,7 +118,6 @@ namespace ShazrinSonar
                 DiagnosticLogs.TryDequeue(out _);
             }
 
-            // Write to debug file
             Task.Run(() =>
             {
                 lock (FileLock)
@@ -194,7 +197,6 @@ namespace ShazrinSonar
                     break;
                 }
 
-                // S7K Sync Pattern Check: Byte 0-1 must be Version 1 (0x0001)
                 ushort syncVerLE = BinaryPrimitives.ReadUInt16LittleEndian(headerBuffer.Slice(0, 2));
                 ushort syncVerBE = BinaryPrimitives.ReadUInt16BigEndian(headerBuffer.Slice(0, 2));
 
@@ -204,7 +206,6 @@ namespace ShazrinSonar
                     continue;
                 }
 
-                // Read Frame Size at bytes 8-11
                 uint frameSizeBE = BinaryPrimitives.ReadUInt32BigEndian(headerBuffer.Slice(8, 4));
                 uint frameSizeLE = BinaryPrimitives.ReadUInt32LittleEndian(headerBuffer.Slice(8, 4));
                 uint frameSize = (frameSizeBE >= 64 && frameSizeBE <= 2097152) ? frameSizeBE : frameSizeLE;
@@ -225,7 +226,6 @@ namespace ShazrinSonar
                 byte[] completeFrame = new byte[frameSize];
                 stream.Read(completeFrame, 0, (int)frameSize);
 
-                // Scan frame header (bytes 32-63) AND inner record header (bytes 64-96) for explicit Record IDs
                 ushort foundRecType = 0;
                 int maxScan = (int)Math.Min(frameSize - 2, 96);
 
@@ -248,11 +248,11 @@ namespace ShazrinSonar
                     }
                 }
 
-                // Categorize by detected Record ID or by Norbit Frame-Size signature
                 if (foundRecType == 7027 || foundRecType == 7006 || foundRecType == 7004 || frameSize == 13515)
                 {
                     Interlocked.Increment(ref _bathymetryFrames);
                     foundRecType = (foundRecType == 0) ? (ushort)7027 : foundRecType;
+                    UnpackRecord7027Data(completeFrame);
                 }
                 else if (foundRecType == 1012 || foundRecType == 1013 || foundRecType == 1015 || foundRecType == 1016 || frameSize == 260)
                 {
@@ -284,6 +284,28 @@ namespace ShazrinSonar
                 stream.SetLength(0);
                 stream.Position = 0;
             }
+        }
+
+        private static void UnpackRecord7027Data(byte[] frame)
+        {
+            if (frame.Length < 96) return;
+
+            try
+            {
+                // Unpack Record 7027 Payload (Header starts at byte offset 64)
+                uint pingNumber = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(64, 4));
+                uint beamCount = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(72, 4));
+
+                // Fallback byte check if beam count yields unexpected scale
+                if (beamCount == 0 || beamCount > 2048)
+                {
+                    beamCount = BinaryPrimitives.ReadUInt16LittleEndian(frame.AsSpan(72, 2));
+                }
+
+                if (pingNumber > 0) _lastPingNumber = pingNumber;
+                if (beamCount > 0 && beamCount <= 2048) _lastBeamCount = beamCount;
+            }
+            catch { }
         }
 
         private static async Task StartQinsyForwarderAsync(CancellationToken ct)
@@ -360,6 +382,10 @@ namespace ShazrinSonar
                     sb.AppendLine($"    ├── Bathymetry (7027) : {bathyFrames:N0}");
                     sb.AppendLine($"    ├── Navigation (1012) : {navFrames:N0}");
                     sb.AppendLine($"    └── System / Misc     : {miscFrames:N0}");
+                    sb.AppendLine("--------------------------------------------------");
+                    sb.AppendLine($"[+] SONAR LIVE TELEMETRY (Record 7027)");
+                    sb.AppendLine($"    ├── Active Ping #     : {_lastPingNumber:N0}");
+                    sb.AppendLine($"    └── Beams Per Ping    : {(_lastBeamCount > 0 ? _lastBeamCount.ToString() : "256 (Default)")}");
                     sb.AppendLine("--------------------------------------------------");
                     sb.AppendLine("[DIAGNOSTIC LOGS]");
 
