@@ -3,6 +3,10 @@
 ##
 ## Get latest from `dotnet new gitignore`
 
+# test files
+ShazrinSonar.lic
+TestCodeProgram.CS
+
 # dotenv files
 .env
 

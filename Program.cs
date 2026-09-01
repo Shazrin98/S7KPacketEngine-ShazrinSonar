@@ -16,10 +16,46 @@ namespace ShazrinSonar
 {
     public class AppSettings
     {
+        // Network Settings
         public string SourceIp { get; set; } = "127.0.0.1";
         public int SourcePort { get; set; } = 7000;
         public string TargetProtocol { get; set; } = "TCP";
         public int TargetPort { get; set; } = 7001;
+
+        // Hydrographic Offsets & Filtering
+        public double SoundVelocity { get; set; } = 1500.0;
+        public double TransducerDraft { get; set; } = 0.85;
+        public double WaterLevelOffset { get; set; } = -0.15;
+        public bool FilterLowQualityBeams { get; set; } = true;
+        public ushort MinQualityFlag { get; set; } = 0x01;
+
+        // Security Settings
+        public string AuthorizedLicenseKey { get; set; } = "SHAZRIN-HWID-DEMO-KEY";
+    }
+
+    public class HydrographicConfig
+    {
+        public double SoundVelocity { get; set; } = 1500.0;    // m/s
+        public double TransducerDraft { get; set; } = 0.85;     // Meters below surface
+        public double WaterLevelOffset { get; set; } = -0.15;   // Tide / Datum correction (m)
+        public double GpsOffsetX { get; set; } = 0.20;         // GPS to Transducer Starboard/Port offset (m)
+        public double GpsOffsetY { get; set; } = 1.50;         // GPS to Transducer Bow/Stern offset (m)
+        public bool FilterLowQualityBeams { get; set; } = true;
+        public ushort MinQualityFlag { get; set; } = 0x01;     // Bit 0 = Valid Detection
+    }
+
+    public struct ExtractedBeamPoint
+    {
+        public ushort BeamIndex;
+        public float Twtt;
+        public float BeamAngleRad;
+        public uint Quality;
+        public double SlantRange;
+        public double CorrectedDepthZ;
+        public double AcrossTrackY;
+        public double AlongTrackX;
+        public double RelativeEasting;
+        public double RelativeNorthing;
     }
 
     internal class Program
@@ -83,7 +119,17 @@ namespace ShazrinSonar
             LoadConfiguration();
             EnableAnsiTerminal();
 
-            try { File.WriteAllText(DebugLogPath, $"--- ShazrinSonar Debug Session Started {DateTime.Now} ---\n"); } catch { }
+            if (!SecurityManager.ValidateAuthorization(Config.AuthorizedLicenseKey))
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("\n[!] ACCESS DENIED: Unauthorized hardware device or missing ShazrinSonar.lic key.");
+                Console.WriteLine($"[!] Hardware Fingerprint: {SecurityManager.GenerateHardwareId()}");
+                Console.ResetColor();
+                return;
+            }
+
+            // Debugging data received in a file
+            // try { File.WriteAllText(DebugLogPath, $"--- ShazrinSonar Debug Session Started {DateTime.Now} ---\n"); } catch { }
 
             Console.Clear();
             Console.CursorVisible = false;
@@ -141,8 +187,21 @@ namespace ShazrinSonar
                     string json = JsonSerializer.Serialize(Config, new JsonSerializerOptions { WriteIndented = true });
                     File.WriteAllText(ConfigPath, json);
                 }
+
+                // Sync loaded settings to processor engine
+                S7KRecord7027Processor.Settings = new HydrographicConfig
+                {
+                    SoundVelocity = Config.SoundVelocity,
+                    TransducerDraft = Config.TransducerDraft,
+                    WaterLevelOffset = Config.WaterLevelOffset,
+                    FilterLowQualityBeams = Config.FilterLowQualityBeams,
+                    MinQualityFlag = Config.MinQualityFlag
+                };
             }
-            catch { Config = new AppSettings(); }
+            catch
+            {
+                Config = new AppSettings();
+            }
         }
 
         private static async Task StartNorbitTcpIngestAsync(CancellationToken ct)
@@ -266,7 +325,8 @@ namespace ShazrinSonar
                 }
 
                 long count = Interlocked.Increment(ref _s7kFramesExtracted);
-                LogDiagnostic($"Synced Frame #{count}: Identified RecID={foundRecType} | Size={frameSize}B");
+                // To show in terminal the Diagnostic Logs
+                // LogDiagnostic($"Synced Frame #{count}: Identified RecID={foundRecType} | Size={frameSize}B");
 
                 FrameQueue.Writer.TryWrite(completeFrame);
             }
@@ -350,9 +410,28 @@ namespace ShazrinSonar
             }
         }
 
+        ///Process to adjust data from S7K Records
         private static byte[] ProcessAndModifyS7KRecord(byte[] frame)
         {
-            return frame;
+            if (frame.Length >= 96)
+            {
+                // Read Frame Type at offset 32 / 64
+                ushort recType = BinaryPrimitives.ReadUInt16LittleEndian(frame.AsSpan(32, 2));
+
+                if (recType == 7027 || frame.Length == 13515)
+                {
+                    // Apply depth offsets, quality filtering, and coordinate transformations
+                    // Pass live vessel attitude (Roll, Pitch, Heading) if available from Record 1012/1016
+                    S7KRecord7027Processor.ProcessRecord7027(
+                        frame,
+                        vesselRollRad: 0.0,
+                        vesselPitchRad: 0.0,
+                        vesselHeadingRad: 0.0
+                    );
+                }
+            }
+
+            return frame; // Return frame with modified byte payload
         }
 
         private static async Task DisplayStatsAsync(CancellationToken ct)
@@ -403,7 +482,7 @@ namespace ShazrinSonar
                     }
 
                     sb.AppendLine("--------------------------------------------------");
-                    sb.AppendLine($"[Log File] Output saved to: s7k_debug.log");
+                    // sb.AppendLine($"[Log File] Output saved to: s7k_debug.log");
                     sb.Append("Press [ENTER] to stop ShazrinSonar gracefully...");
 
                     lock (ConsoleLock)
@@ -416,5 +495,106 @@ namespace ShazrinSonar
             }
             catch (OperationCanceledException) { }
         }
+        ///////////////////////////////////////
+        public static class S7KRecord7027Processor
+        {
+            public static HydrographicConfig Settings { get; set; } = new HydrographicConfig();
+
+            /// <summary>
+            /// Parses, filters, and transforms a 7027 frame buffer in-place or returns calculated points.
+            /// </summary>
+            public static ExtractedBeamPoint[] ProcessRecord7027(
+                byte[] frame,
+                double vesselRollRad = 0.0,
+                double vesselPitchRad = 0.0,
+                double vesselHeadingRad = 0.0)
+            {
+                if (frame.Length < 96) return Array.Empty<ExtractedBeamPoint>();
+
+                // Frame Header: Byte 64 is the start of Record 7027 Data Header
+                Span<byte> recordData = frame.AsSpan(64);
+
+                uint pingNumber = BinaryPrimitives.ReadUInt32LittleEndian(recordData.Slice(0, 4));
+                uint beamCount = BinaryPrimitives.ReadUInt32LittleEndian(recordData.Slice(8, 4));
+
+                if (beamCount == 0 || beamCount > 2048)
+                {
+                    beamCount = BinaryPrimitives.ReadUInt16LittleEndian(recordData.Slice(8, 2));
+                }
+
+                if (beamCount == 0 || beamCount > 2048) return Array.Empty<ExtractedBeamPoint>();
+
+                // Payload Byte Offsets relative to Record 7027 Data Header (Byte 64)
+                int twttArrayOffset = 32;
+                int qualityArrayOffset = twttArrayOffset + (int)(beamCount * 4); // 4 bytes per float TWTT
+                int angleArrayOffset = qualityArrayOffset + (int)(beamCount * 4); // 4 bytes per uint Quality
+
+                if (recordData.Length < angleArrayOffset + (beamCount * 4))
+                {
+                    return Array.Empty<ExtractedBeamPoint>();
+                }
+
+                var validPoints = new ExtractedBeamPoint[beamCount];
+                int validBeamCount = 0;
+
+                for (ushort i = 0; i < beamCount; i++)
+                {
+                    // Unpack TWTT (Float32, seconds)
+                    float twtt = BinaryPrimitives.ReadSingleLittleEndian(recordData.Slice(twttArrayOffset + (i * 4), 4));
+
+                    // Unpack Quality Flag (UInt32 bitmask)
+                    uint quality = BinaryPrimitives.ReadUInt32LittleEndian(recordData.Slice(qualityArrayOffset + (i * 4), 4));
+
+                    // Unpack Beam Angle (Float32, radians relative to array nadir)
+                    float beamAngle = BinaryPrimitives.ReadSingleLittleEndian(recordData.Slice(angleArrayOffset + (i * 4), 4));
+
+                    // Quality Filtering: Discard zero TWTT or invalid phase/amplitude flags
+                    if (twtt <= 0.0001f) continue;
+                    if (Settings.FilterLowQualityBeams && (quality & Settings.MinQualityFlag) == 0) continue;
+
+                    // 1. Slant Range Calculation
+                    double slantRange = (Settings.SoundVelocity * twtt) / 2.0;
+
+                    // 2. Roll & Pitch Compensation
+                    double totalAngleRad = beamAngle + vesselRollRad;
+                    double depthZRaw = slantRange * Math.Cos(totalAngleRad) * Math.Cos(vesselPitchRad);
+                    double acrossTrackY = slantRange * Math.Sin(totalAngleRad);
+                    double alongTrackX = slantRange * Math.Sin(vesselPitchRad);
+
+                    // 3. Depth Offsets (Transducer Draft + Tidal/Datum adjustment)
+                    double correctedDepthZ = depthZRaw + Settings.TransducerDraft + Settings.WaterLevelOffset;
+
+                    // 4. GPS & Vessel Heading Projection
+                    double sinHeading = Math.Sin(vesselHeadingRad);
+                    double cosHeading = Math.Cos(vesselHeadingRad);
+
+                    double relEasting = (alongTrackX * sinHeading) + (acrossTrackY * cosHeading) + Settings.GpsOffsetX;
+                    double relNorthing = (alongTrackX * cosHeading) - (acrossTrackY * sinHeading) + Settings.GpsOffsetY;
+
+                    // 5. In-Place Binary Repacking: Write corrected TWTT back to stream buffer
+                    // Re-calculate modified TWTT corresponding to adjusted depth if required by Qinsy
+                    float depthTwttModified = (float)((correctedDepthZ * 2.0) / Settings.SoundVelocity);
+                    BinaryPrimitives.WriteSingleLittleEndian(recordData.Slice(twttArrayOffset + (i * 4), 4), depthTwttModified);
+
+                    validPoints[validBeamCount++] = new ExtractedBeamPoint
+                    {
+                        BeamIndex = i,
+                        Twtt = twtt,
+                        BeamAngleRad = beamAngle,
+                        Quality = quality,
+                        SlantRange = slantRange,
+                        CorrectedDepthZ = correctedDepthZ,
+                        AcrossTrackY = acrossTrackY,
+                        AlongTrackX = alongTrackX,
+                        RelativeEasting = relEasting,
+                        RelativeNorthing = relNorthing
+                    };
+                }
+
+                Array.Resize(ref validPoints, validBeamCount);
+                return validPoints;
+            }
+        }
+        /////////////////////////////////////////////////
     }
 }

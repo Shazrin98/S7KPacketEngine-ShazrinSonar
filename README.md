@@ -13,3 +13,11 @@ dotnet --list-sdks //
 git --version
 //
 6. You should see .NET SDK 8.x.xxx listed along with the installed Git version.
+7. To generate license key on first-time use, run:
+//
+dotnet build 
+//
+8. To start the program, run:
+//
+dotnet run 
+//
