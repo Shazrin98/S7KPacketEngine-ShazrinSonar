@@ -2,5 +2,13 @@
   "SourceIp": "127.0.0.1",
   "SourcePort": 7000,
   "TargetProtocol": "TCP",
-  "TargetPort": 7001
+  "TargetPort": 7001,
+
+  "SoundVelocity": 1500.0,
+  "TransducerDraft": 0.85,
+  "WaterLevelOffset": -0.15,
+  "FilterLowQualityBeams": true,
+  "MinQualityFlag": 1,
+
+  "AuthorizedLicenseKey": "FAE34D45D2E66AA2"
 }

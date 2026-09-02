@@ -438,6 +438,8 @@ namespace ShazrinSonar
         {
             try
             {
+                string hwid = SecurityManager.GenerateHardwareId();
+
                 while (!ct.IsCancellationRequested)
                 {
                     double mbIngested = Interlocked.Read(ref _totalBytesRead) / 1024.0 / 1024.0;
@@ -452,26 +454,31 @@ namespace ShazrinSonar
                     sb.AppendLine("==================================================");
                     sb.AppendLine("         SHAZRIN SONAR - S7K STREAM ENGINE        ");
                     sb.AppendLine("==================================================");
-                    sb.AppendLine($"[+] Source (Norbit TCP Client) : {Config.SourceIp}:{Config.SourcePort}");
-                    sb.AppendLine($"[+] Target (Qinsy {Config.TargetProtocol} Server): Port {Config.TargetPort}");
+                    sb.AppendLine($"[+] License Status        : AUTHORIZED (HWID: {hwid})");
+                    sb.AppendLine($"[+] Source (Norbit Client): {Config.SourceIp}:{Config.SourcePort}");
+                    sb.AppendLine($"[+] Target (Qinsy Server) : Port {Config.TargetPort} ({Config.TargetProtocol})");
                     sb.AppendLine("--------------------------------------------------");
-                    sb.AppendLine($"[+] Stream Status         : ACTIVE");
-                    sb.AppendLine($"[+] Raw Ingested Data     : {mbIngested:F2} MB");
-                    sb.AppendLine($"[+] S7K Records Extracted : {totalFrames:N0}");
-                    sb.AppendLine($"    ├── Bathymetry (7027) : {bathyFrames:N0}");
-                    sb.AppendLine($"    ├── Navigation (1012) : {navFrames:N0}");
-                    sb.AppendLine($"    └── System / Misc     : {miscFrames:N0}");
+                    sb.AppendLine("[+] HYDROGRAPHIC CONFIGURATION");
+                    sb.AppendLine($"    ├── Sound Velocity    : {S7KRecord7027Processor.Settings.SoundVelocity:F1} m/s");
+                    sb.AppendLine($"    ├── Transducer Draft  : +{S7KRecord7027Processor.Settings.TransducerDraft:F2} m");
+                    sb.AppendLine($"    ├── Water Level/Tide  : {S7KRecord7027Processor.Settings.WaterLevelOffset:+0.00;-0.00;0.00} m");
+                    sb.AppendLine($"    └── Quality Filter    : {(S7KRecord7027Processor.Settings.FilterLowQualityBeams ? "ENABLED" : "DISABLED")}");
                     sb.AppendLine("--------------------------------------------------");
-                    sb.AppendLine($"[+] SONAR LIVE TELEMETRY (Record 7027)");
+                    sb.AppendLine($"[+] STREAM METRICS");
+                    sb.AppendLine($"    ├── Raw Ingested Data : {mbIngested:F2} MB");
+                    sb.AppendLine($"    ├── S7K Records Total : {totalFrames:N0}");
+                    sb.AppendLine($"    │   ├── Bathymetry(7027) : {bathyFrames:N0}");
+                    sb.AppendLine($"    │   ├── Navigation(1012) : {navFrames:N0}");
+                    sb.AppendLine($"    │   └── System / Misc    : {miscFrames:N0}");
                     sb.AppendLine($"    ├── Active Ping #     : {_lastPingNumber:N0}");
-                    sb.AppendLine($"    └── Beams Per Ping    : {(_lastBeamCount > 0 ? _lastBeamCount.ToString() : "256 (Default)")}");
+                    sb.AppendLine($"    └── Beams Per Ping    : {(_lastBeamCount > 0 ? _lastBeamCount.ToString() : "64")}");
                     sb.AppendLine("--------------------------------------------------");
                     sb.AppendLine("[DIAGNOSTIC LOGS]");
 
                     var logs = DiagnosticLogs.ToArray();
                     if (logs.Length == 0)
                     {
-                        sb.AppendLine(" > Waiting for frames...");
+                        sb.AppendLine(" > Waiting for data stream...");
                     }
                     else
                     {
@@ -482,7 +489,7 @@ namespace ShazrinSonar
                     }
 
                     sb.AppendLine("--------------------------------------------------");
-                    // sb.AppendLine($"[Log File] Output saved to: s7k_debug.log");
+                    sb.AppendLine($"[Log File] Output saved to: {DebugLogPath}");
                     sb.Append("Press [ENTER] to stop ShazrinSonar gracefully...");
 
                     lock (ConsoleLock)
