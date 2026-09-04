@@ -4,7 +4,6 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -18,11 +17,9 @@ namespace ShazrinSonar
     {
         private static readonly string ConfigPath = "ShazrinSonar_Config.json";
         private static readonly string DebugLogPath = "s7k_debug.log";
-
-        // HIGH PRIORITY FIX: Use ConfigManager for thread-safe config access and live reloads
         private static readonly ConfigManager _configManager = new ConfigManager(ConfigPath);
         private static AppSettings Config => _configManager.Current;
-
+        
         private static readonly object ConsoleLock = new object();
         private static readonly object FileLock = new object();
 
@@ -42,7 +39,7 @@ namespace ShazrinSonar
         private static long _positionFrames = 0;
         private static long _otherRecordFrames = 0;
 
-        // Active Record 7027 Telemetry
+        // Active Record 7027 Telemetry (Atomic primitives)
         private static uint _lastPingNumber = 0;
         private static uint _lastBeamCount = 0;
 
@@ -101,11 +98,24 @@ namespace ShazrinSonar
             Task forwardTask = Task.Run(() => forwarder.StartAsync(cts.Token));
             Task statsTask = Task.Run(() => DisplayStatsAsync(cts.Token));
 
-            Console.ReadLine();
+            try
+            {
+                await Task.Run(() => Console.ReadLine());
+            }
+            finally
+            {
+                cts.Cancel();
+            }
 
-            cts.Cancel();
-            try { await Task.WhenAll(ingestTask, forwardTask, statsTask); }
+            try 
+            { 
+                await Task.WhenAll(ingestTask, forwardTask, statsTask); 
+            }
             catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                LogDiagnostic($"[!] Shutdown exception: {ex.Message}");
+            }
 
             lock (ConsoleLock)
             {
@@ -124,7 +134,7 @@ namespace ShazrinSonar
                 DiagnosticLogs.TryDequeue(out _);
             }
 
-            Task.Run(() =>
+            ThreadPool.QueueUserWorkItem(_ =>
             {
                 lock (FileLock)
                 {
@@ -135,16 +145,18 @@ namespace ShazrinSonar
 
         private static void LoadConfiguration()
         {
-            var cfg = Config;
+            UpdateHydrographicSettings(_configManager.Current);
 
-            S7KFrameProcessor.Settings = new HydrographicConfig
+            _configManager.OnConfigReloaded += (newConfig) =>
             {
-                SoundVelocity = cfg.SoundVelocity,
-                TransducerDraft = cfg.TransducerDraft,
-                WaterLevelOffset = cfg.WaterLevelOffset,
-                FilterLowQualityBeams = cfg.FilterLowQualityBeams,
-                MinQualityFlag = cfg.MinQualityFlag
+                UpdateHydrographicSettings(newConfig);
+                LogDiagnostic($"[CONFIG] Live Reload: Draft={newConfig.TransducerDraft}m, Tide={newConfig.WaterLevelOffset}m, SV={newConfig.SoundVelocity}m/s");
             };
+        }
+
+        private static void UpdateHydrographicSettings(AppSettings cfg)
+        {
+            S7KFrameProcessor.Settings = cfg.ToHydrographicConfig();
         }
 
         private static void HandleFrameTelemetry(int bytesRead, ushort recType, byte[] frame)
@@ -181,8 +193,8 @@ namespace ShazrinSonar
                     beamCount = BinaryPrimitives.ReadUInt16LittleEndian(frame.AsSpan(72, 2));
                 }
 
-                if (pingNumber > 0) _lastPingNumber = pingNumber;
-                if (beamCount > 0 && beamCount <= 2048) _lastBeamCount = beamCount;
+                if (pingNumber > 0) Interlocked.Exchange(ref _lastPingNumber, pingNumber);
+                if (beamCount > 0 && beamCount <= 2048) Interlocked.Exchange(ref _lastBeamCount, beamCount);
             }
             catch { }
         }
@@ -200,6 +212,9 @@ namespace ShazrinSonar
                     long bathyFrames = Interlocked.Read(ref _bathymetryFrames);
                     long navFrames = Interlocked.Read(ref _positionFrames);
                     long miscFrames = Interlocked.Read(ref _otherRecordFrames);
+
+                    uint currentPing = Interlocked.CompareExchange(ref _lastPingNumber, 0, 0);
+                    uint currentBeams = Interlocked.CompareExchange(ref _lastBeamCount, 0, 0);
 
                     var sb = new StringBuilder();
                     sb.Append("\x1b[H\x1b[J");
@@ -223,8 +238,8 @@ namespace ShazrinSonar
                     sb.AppendLine($"    │   ├── Bathymetry(7027) : {bathyFrames:N0}");
                     sb.AppendLine($"    │   ├── Navigation(1012) : {navFrames:N0}");
                     sb.AppendLine($"    │   └── System / Misc    : {miscFrames:N0}");
-                    sb.AppendLine($"    ├── Active Ping #     : {_lastPingNumber:N0}");
-                    sb.AppendLine($"    └── Beams Per Ping    : {(_lastBeamCount > 0 ? _lastBeamCount.ToString() : "64")}");
+                    sb.AppendLine($"    ├── Active Ping #     : {currentPing:N0}");
+                    sb.AppendLine($"    └── Beams Per Ping    : {(currentBeams > 0 ? currentBeams.ToString() : "64")}");
                     sb.AppendLine("--------------------------------------------------");
                     sb.AppendLine("[DIAGNOSTIC LOGS]");
 

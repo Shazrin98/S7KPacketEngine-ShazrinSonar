@@ -1,11 +1,11 @@
 using System;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using ShazrinSonar.Config;
-using ShazrinSonar.Processing;
 
 namespace ShazrinSonar.Networking
 {
@@ -22,15 +22,30 @@ namespace ShazrinSonar.Networking
             _logger = logger;
         }
 
+        private static void ConfigureKeepAlive(Socket socket)
+        {
+            try
+            {
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);      // 5 seconds idle before probing
+                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 1);  // 1 second interval between probes
+                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3); // 3 failed probes before dropping
+            }
+            catch (SocketException)
+            {
+                // Graceful fallback for unsupported platform socket options
+            }
+        }
+
         public async Task StartAsync(CancellationToken ct)
         {
             if (_config.TargetProtocol.Equals("TCP", StringComparison.OrdinalIgnoreCase))
             {
                 var listener = new TcpListener(IPAddress.Any, _config.TargetPort);
-                listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-
+                
                 try
                 {
+                    listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
                     listener.Start();
                     _logger($"Qinsy TCP Forwarder listening on port {_config.TargetPort}.");
                 }
@@ -53,36 +68,47 @@ namespace ShazrinSonar.Networking
                         try
                         {
                             using TcpClient qinsyClient = await listener.AcceptTcpClientAsync(ct);
-                            // Configure Keep-Alive on Qinsy client socket
-                            qinsyClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-                            qinsyClient.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);
-                            qinsyClient.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 1);
-                            qinsyClient.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
+                            ConfigureKeepAlive(qinsyClient.Client);
+                            
                             _logger("Qinsy client connected.");
-
-                            // Flush accumulated historical pings to guarantee live timing
-                            int droppedCount = 0;
-                            while (_frameQueue.Reader.TryRead(out _))
-                            {
-                                droppedCount++;
-                            }
-                            if (droppedCount > 0)
-                            {
-                                _logger($"[CRITICAL] Flushed {droppedCount} stale frame(s) from queue for real-time sync.");
-                            }
 
                             using NetworkStream qinsyStream = qinsyClient.GetStream();
 
-                            await foreach (byte[] frame in _frameQueue.Reader.ReadAllAsync(ct))
+                            // Read pre-modified frames from queue and stream directly
+                            while (!ct.IsCancellationRequested && qinsyClient.Connected)
                             {
-                                byte[] processedFrame = S7KFrameProcessor.ProcessAndModifyS7KRecord(frame);
-                                await qinsyStream.WriteAsync(processedFrame, 0, processedFrame.Length, ct);
+                                if (await _frameQueue.Reader.WaitToReadAsync(ct))
+                                {
+                                    bool wroteAny = false;
+                                    while (_frameQueue.Reader.TryRead(out byte[]? frame))
+                                    {
+                                        if (frame == null || frame.Length == 0) continue;
+
+                                        // Write frame asynchronously using ReadOnlyMemory overload
+                                        await qinsyStream.WriteAsync(frame.AsMemory(), ct);
+                                        wroteAny = true;
+                                    }
+
+                                    // Flush network stream once per batch drain to optimize context switches
+                                    if (wroteAny)
+                                    {
+                                        await qinsyStream.FlushAsync(ct);
+                                    }
+                                }
                             }
                         }
                         catch (OperationCanceledException) { break; }
-                        catch (Exception ex)
+                        catch (IOException ex)
                         {
                             _logger($"Client session ended: {ex.Message}");
+                        }
+                        catch (SocketException ex)
+                        {
+                            _logger($"Client socket exception: {ex.Message}");
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger($"Client session error: {ex.Message}");
                         }
                     }
                 }
@@ -95,14 +121,22 @@ namespace ShazrinSonar.Networking
             else
             {
                 using var udpClient = new UdpClient();
-                var targetEndpoint = new IPEndPoint(IPAddress.Parse("127.0.0.1"), _config.TargetPort);
+                
+                string targetIpStr = string.IsNullOrWhiteSpace(_config.SourceIp) ? "127.0.0.1" : _config.SourceIp;
+                if (!IPAddress.TryParse(targetIpStr, out var targetIp))
+                {
+                    targetIp = IPAddress.Loopback;
+                }
+
+                var targetEndpoint = new IPEndPoint(targetIp, _config.TargetPort);
+                _logger($"Qinsy UDP Forwarder broadcasting to {targetEndpoint}...");
 
                 try
                 {
                     await foreach (byte[] frame in _frameQueue.Reader.ReadAllAsync(ct))
                     {
-                        byte[] processedFrame = S7KFrameProcessor.ProcessAndModifyS7KRecord(frame);
-                        await udpClient.SendAsync(processedFrame, processedFrame.Length, targetEndpoint);
+                        if (frame == null || frame.Length == 0) continue;
+                        await udpClient.SendAsync(frame.AsMemory(), targetEndpoint, ct);
                     }
                 }
                 catch (OperationCanceledException) { }

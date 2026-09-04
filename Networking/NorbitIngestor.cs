@@ -18,10 +18,17 @@ namespace ShazrinSonar.Networking
 
         private static void ConfigureKeepAlive(Socket socket)
         {
-            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);      // 5 seconds idle before probing
-            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 1);  // 1 second interval between probes
-            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3); // 3 failed probes before dropping connection
+            try
+            {
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);      // 5 seconds idle before probing
+                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 1);  // 1 second interval between probes
+                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3); // 3 failed probes before dropping
+            }
+            catch (SocketException)
+            {
+                // Graceful fallback for non-supported platform socket drivers
+            }
         }
 
         public NorbitIngestor(
@@ -38,6 +45,9 @@ namespace ShazrinSonar.Networking
 
         public async Task StartAsync(CancellationToken ct)
         {
+            int reconnectDelayMs = 1000;
+            const int maxReconnectDelayMs = 10000;
+
             while (!ct.IsCancellationRequested)
             {
                 try
@@ -45,11 +55,11 @@ namespace ShazrinSonar.Networking
                     using var client = new TcpClient();
                     _logger($"Connecting to {_config.SourceIp}:{_config.SourcePort}...");
                     await client.ConnectAsync(_config.SourceIp, _config.SourcePort, ct);
-                    // Enable aggressive Keep-Alive
+                    
                     ConfigureKeepAlive(client.Client);
                     _logger("Connected to Norbit stream source.");
 
-                    // Clear stream accumulator state prior to reading new socket bytes
+                    reconnectDelayMs = 1000;
                     _accumulator.Clear();
 
                     using NetworkStream stream = client.GetStream();
@@ -57,22 +67,31 @@ namespace ShazrinSonar.Networking
 
                     while (!ct.IsCancellationRequested && client.Connected)
                     {
-                        int bytesRead = await stream.ReadAsync(readBuffer, 0, readBuffer.Length, ct);
+                        int bytesRead = await stream.ReadAsync(readBuffer.AsMemory(), ct);
                         if (bytesRead == 0) break;
 
-                        foreach (var (frame, recType) in _accumulator.PushBytesAndExtractFrames(readBuffer, bytesRead))
+                        foreach (var (rawFrame, recType) in _accumulator.PushBytesAndExtractFrames(readBuffer, bytesRead))
                         {
-                            _telemetryCallback(bytesRead, recType, frame);
-                            _frameQueue.Writer.TryWrite(frame);
+                            // Transform TWTT & hydrographic depth in-place
+                            byte[] modifiedFrame = S7KFrameProcessor.ProcessAndModifyS7KRecord(rawFrame);
+
+                            _telemetryCallback(modifiedFrame.Length, recType, modifiedFrame);
+                            _frameQueue.Writer.TryWrite(modifiedFrame);
                         }
                     }
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex)
                 {
-                    _accumulator.Clear(); // Clear corrupt stream fragments on network error
-                    _logger($"Ingest Error: {ex.Message}");
-                    try { await Task.Delay(2000, ct); } catch (OperationCanceledException) { break; }
+                    _accumulator.Clear();
+                    _logger($"Ingest Error: {ex.Message}. Retrying in {reconnectDelayMs / 1000}s...");
+                    
+                    try 
+                    { 
+                        await Task.Delay(reconnectDelayMs, ct); 
+                        reconnectDelayMs = Math.Min(reconnectDelayMs * 2, maxReconnectDelayMs);
+                    } 
+                    catch (OperationCanceledException) { break; }
                 }
             }
         }
