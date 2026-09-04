@@ -9,10 +9,7 @@ namespace ShazrinSonar
 {
     public static class SecurityManager
     {
-        /// <summary>
-        /// Generates a cross-platform 16-character Hardware Fingerprint.
-        /// Compatible with Windows, macOS, and Linux natively.
-        /// </summary>
+        /// Generates a cross-platform 16-character Hardware Fingerprint. Compatible with Windows, macOS, and Linux natively.
         public static string GenerateHardwareId()
         {
             try
@@ -40,10 +37,8 @@ namespace ShazrinSonar
             }
         }
 
-        /// <summary>
         /// Validates offline license authorization via local .lic file or removable USB drive.
         /// Return "true" or "false" to test authorization
-        /// </summary>
         public static bool ValidateAuthorization(string expectedKey)
         {
             string currentHwid = GenerateHardwareId();
