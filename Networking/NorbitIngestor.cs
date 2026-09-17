@@ -17,6 +17,7 @@ namespace ShazrinSonar.Networking
         private readonly Action<string> _logger;
         private readonly Action<int, ushort, byte[]> _telemetryCallback;
         private static readonly object _fileLock = new object();
+        private int _rawDumpCounter = 0; // to measure raw incoming data
 
         public NorbitIngestor(
             AppSettings config,
@@ -75,6 +76,16 @@ namespace ShazrinSonar.Networking
                         {
                             bytesRead = await stream.ReadAsync(readBuffer.AsMemory(), ct);
                             SafeLog(logPath, $"[INGESTOR] Read {bytesRead} raw bytes from port {_config.SourcePort}.");
+
+                            // --- RAW HEX DIAGNOSTIC DUMP ---
+                            if (_rawDumpCounter < 10 && bytesRead > 0)
+                            {
+                                // Capture the first 256 bytes of the packet (or less if it's a small packet)
+                                string hexDump = BitConverter.ToString(readBuffer, 0, Math.Min(bytesRead, 256));
+                                SafeLog(logPath, $"[RAW PACKET {_rawDumpCounter}] Length: {bytesRead} | Data: {hexDump}");
+                                _rawDumpCounter++;
+                            }
+                            // -------------------------------
                         }
                         catch (Exception ex)
                         {
@@ -109,7 +120,7 @@ namespace ShazrinSonar.Networking
                             _telemetryCallback(rawFrame.Length, recType, rawFrame);
                             _frameQueue.Writer.TryWrite(rawFrame);
                         }
-                         // //////////////////////////////////////////////////////
+                        // //////////////////////////////////////////////////////
                     }
                 }
                 catch (OperationCanceledException) { break; }

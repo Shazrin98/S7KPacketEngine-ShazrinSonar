@@ -21,39 +21,21 @@ namespace ShazrinSonar.Processing
     public static class S7KFrameProcessor
     {
         public static HydrographicConfig Settings { get; set; } = new HydrographicConfig();
-
-        // Toggle for verbose diagnostic logging
         public static bool EnableDebugLogging { get; set; } = false;
 
         public static byte[] ProcessAndModifyS7KRecord(byte[] frame)
         {
-            if (frame == null)
+            if (frame == null) return Array.Empty<byte>();
+            
+            // Total minimum length is 36 (Wrapper) + 64 (S7K Header) + 32 (Min Data) = 132 bytes
+            if (frame.Length < 132) return frame;
+
+            // Extract Record Type from the inner S7K header (Byte 68)
+            uint recType32 = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(68, 4));
+
+            if (recType32 == 7027)
             {
-                if (EnableDebugLogging) Console.WriteLine("[S7K] Frame rejected: Frame is null.");
-                return Array.Empty<byte>();
-            }
-
-            if (frame.Length < 96)
-            {
-                if (EnableDebugLogging) Console.WriteLine($"[S7K] Frame rejected: Length ({frame.Length}) < 96 bytes.");
-                return frame;
-            }
-
-            // Flexible record type check across standard S7K header offsets
-            ushort recType16 = BinaryPrimitives.ReadUInt16LittleEndian(frame.AsSpan(32, 2));
-            uint recType32 = frame.Length >= 36 ? BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(32, 4)) : 0;
-            uint recType20 = frame.Length >= 24 ? BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(20, 4)) : 0;
-
-            bool is7027 = (recType16 == 7027) || (recType32 == 7027) || (recType20 == 7027) || (frame.Length == 13515);
-
-            if (is7027)
-            {
-                // ProcessRecord7027 modifies the TWTT in-place natively via BinaryPrimitives
                 ProcessRecord7027(frame);
-            }
-            else if (EnableDebugLogging)
-            {
-                Console.WriteLine($"[S7K] Skipped record type {recType16}.");
             }
 
             return frame;
@@ -65,36 +47,25 @@ namespace ShazrinSonar.Processing
             double vesselPitchRad = 0.0,
             double vesselHeadingRad = 0.0)
         {
-            if (frame == null || frame.Length < 96) return Array.Empty<ExtractedBeamPoint>();
+            if (frame == null || frame.Length < 132) return Array.Empty<ExtractedBeamPoint>();
 
-            // Ensure Sound Velocity is valid to prevent Division-by-Zero (NaN / Infinity)
             double soundVelocity = Settings.SoundVelocity > 100.0 ? Settings.SoundVelocity : 1500.0;
+            
+            // Skip the 36-byte wrapper and the 64-byte S7K header to reach the Record 7027 Data block
+            Span<byte> recordData = frame.AsSpan(100); 
 
-            Span<byte> recordData = frame.AsSpan(64);
-
-            // EXACT OLD CODE OFFSETS RESTORED
+            // Ping Number is at Record Header offset 8
             uint pingNumber = BinaryPrimitives.ReadUInt32LittleEndian(recordData.Slice(8, 4));
+            // Beam Count is at Record Header offset 14
             ushort beamCount = BinaryPrimitives.ReadUInt16LittleEndian(recordData.Slice(14, 2));
 
-            // Fallback for mock or test frames
-            if (beamCount == 0 || beamCount > 2048)
-            {
-                beamCount = 1;
-            }
+            if (beamCount == 0 || beamCount > 2048) beamCount = 1;
 
-            int twttArrayOffset = 32; // Byte 96 of frame
+            int twttArrayOffset = 32; // This is relative to the recordData span (Absolute byte 132 in the frame)
             int qualityArrayOffset = twttArrayOffset + (int)(beamCount * 4);
             int angleArrayOffset = qualityArrayOffset + (int)(beamCount * 4);
 
-            // Minimum buffer check: frame must at least contain TWTT offset for beam 0
-            if (recordData.Length < twttArrayOffset + 4)
-            {
-                if (EnableDebugLogging)
-                {
-                    Console.WriteLine($"[S7K R7027] Buffer truncation: Required at least {twttArrayOffset + 4} bytes, got {recordData.Length}.");
-                }
-                return Array.Empty<ExtractedBeamPoint>();
-            }
+            if (recordData.Length < twttArrayOffset + 4) return Array.Empty<ExtractedBeamPoint>();
 
             var validPoints = new ExtractedBeamPoint[beamCount];
             int validBeamCount = 0;
@@ -106,7 +77,6 @@ namespace ShazrinSonar.Processing
 
                 float twtt = BinaryPrimitives.ReadSingleLittleEndian(recordData.Slice(currentTwttOffset, 4));
 
-                // Safely read quality flag if array exists in buffer; default to 0x01 for test packets
                 uint quality = 0x01;
                 int currentQualityOffset = qualityArrayOffset + (i * 4);
                 if (currentQualityOffset + 4 <= recordData.Length)
@@ -114,7 +84,6 @@ namespace ShazrinSonar.Processing
                     quality = BinaryPrimitives.ReadUInt32LittleEndian(recordData.Slice(currentQualityOffset, 4));
                 }
 
-                // Safely read beam angle if array exists in buffer; default to 0.0 rad (nadir)
                 float beamAngle = 0.0f;
                 int currentAngleOffset = angleArrayOffset + (i * 4);
                 if (currentAngleOffset + 4 <= recordData.Length)
@@ -122,10 +91,8 @@ namespace ShazrinSonar.Processing
                     beamAngle = BinaryPrimitives.ReadSingleLittleEndian(recordData.Slice(currentAngleOffset, 4));
                 }
 
-                // Reject invalid or non-returning travel times
                 if (twtt <= 0.0001f) continue;
 
-                // Quality filtering safeguard: Only filter if quality array was explicitly provided (>0)
                 if (Settings.FilterLowQualityBeams && Settings.MinQualityFlag != 0 && quality != 0)
                 {
                     if ((quality & Settings.MinQualityFlag) == 0) continue;
@@ -146,10 +113,9 @@ namespace ShazrinSonar.Processing
                 double relEasting = (alongTrackX * sinHeading) + (acrossTrackY * cosHeading) + Settings.GpsOffsetX;
                 double relNorthing = (alongTrackX * cosHeading) - (acrossTrackY * sinHeading) + Settings.GpsOffsetY;
 
-                // Calculate modified TWTT based on corrected depth
                 float depthTwttModified = (float)((correctedDepthZ * 2.0) / soundVelocity);
 
-                // Overwrite TWTT directly in the frame buffer for downstream forwarding
+                // Overwrite TWTT directly in the frame buffer 
                 BinaryPrimitives.WriteSingleLittleEndian(recordData.Slice(currentTwttOffset, 4), depthTwttModified);
 
                 validPoints[validBeamCount++] = new ExtractedBeamPoint
