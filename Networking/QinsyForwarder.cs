@@ -14,6 +14,7 @@ namespace ShazrinSonar.Networking
         private readonly AppSettings _config;
         private readonly Channel<byte[]> _frameQueue;
         private readonly Action<string> _logger;
+        private static readonly object _fileLock = new object();
 
         public QinsyForwarder(AppSettings config, Channel<byte[]> frameQueue, Action<string> logger)
         {
@@ -27,22 +28,22 @@ namespace ShazrinSonar.Networking
             try
             {
                 socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);      // 5 seconds idle before probing
-                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 1);  // 1 second interval between probes
-                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3); // 3 failed probes before dropping
+                socket.NoDelay = true; // Disable Nagle's algorithm for low-latency transmission
             }
-            catch (SocketException)
+            catch (Exception ex)
             {
-                // Graceful fallback for unsupported platform socket options
+                SafeLog("pipeline_debug.log", $"[WARN] Socket option warning: {ex.Message}");
             }
         }
 
         public async Task StartAsync(CancellationToken ct)
         {
+            string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "pipeline_debug.log");
+
             if (_config.TargetProtocol.Equals("TCP", StringComparison.OrdinalIgnoreCase))
             {
                 var listener = new TcpListener(IPAddress.Any, _config.TargetPort);
-                
+
                 try
                 {
                     listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
@@ -69,7 +70,7 @@ namespace ShazrinSonar.Networking
                         {
                             using TcpClient qinsyClient = await listener.AcceptTcpClientAsync(ct);
                             ConfigureKeepAlive(qinsyClient.Client);
-                            
+
                             _logger("Qinsy client connected.");
 
                             using NetworkStream qinsyStream = qinsyClient.GetStream();
@@ -84,7 +85,8 @@ namespace ShazrinSonar.Networking
                                     {
                                         if (frame == null || frame.Length == 0) continue;
 
-                                        // Write frame asynchronously using ReadOnlyMemory overload
+                                        SafeLog(logPath, $"[FORWARDER] Writing frame (Length: {frame.Length}) to Qinsy client on port {_config.TargetPort}");
+
                                         await qinsyStream.WriteAsync(frame.AsMemory(), ct);
                                         wroteAny = true;
                                     }
@@ -121,7 +123,7 @@ namespace ShazrinSonar.Networking
             else
             {
                 using var udpClient = new UdpClient();
-                
+
                 string targetIpStr = string.IsNullOrWhiteSpace(_config.SourceIp) ? "127.0.0.1" : _config.SourceIp;
                 if (!IPAddress.TryParse(targetIpStr, out var targetIp))
                 {
@@ -144,6 +146,26 @@ namespace ShazrinSonar.Networking
                 {
                     _logger($"UDP Forwarder Error: {ex.Message}");
                 }
+            }
+        }
+
+        /// <summary>
+        /// Thread-safe file logger to prevent file-locking exceptions during high-frequency I/O.
+        /// </summary>
+        private static void SafeLog(string path, string message)
+        {
+            try
+            {
+                lock (_fileLock)
+                {
+                    using var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                    using var writer = new StreamWriter(stream);
+                    writer.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] {message}");
+                }
+            }
+            catch
+            {
+                // Non-blocking catch to ensure logging never interrupts telemetry transmission
             }
         }
     }

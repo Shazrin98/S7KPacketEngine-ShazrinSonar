@@ -8,53 +8,76 @@ namespace ShazrinSonar.Processing
     public class S7KStreamAccumulator
     {
         private readonly List<byte> _buffer = new List<byte>();
+        private int _consecutiveDropCount = 0;
+        
+        // NECESSARY CHANGE: Replaced SafeLog with a delegate so we can log to UI without locking the disk
+        private readonly Action<string>? _diagnosticLogger;
+
+        public S7KStreamAccumulator(Action<string>? diagnosticLogger = null)
+        {
+            _diagnosticLogger = diagnosticLogger;
+        }
 
         public void Clear()
         {
             _buffer.Clear();
+            _consecutiveDropCount = 0;
         }
 
-        public List<(byte[] Frame, ushort RecType)> PushBytesAndExtractFrames(byte[] buffer, int bytesRead)
+        // NECESSARY CHANGE: Return type updated to a Tuple to pass GarbageBytes up to the dashboard
+        public (List<(byte[] Frame, ushort RecType)> Frames, int GarbageBytes) PushBytesAndExtractFrames(byte[] buffer, int bytesRead)
         {
             var frames = new List<(byte[] Frame, ushort RecType)>();
-            if (buffer == null || bytesRead <= 0) return frames;
+            if (buffer == null || bytesRead <= 0) return (frames, 0);
 
-            // Append incoming stream chunk to processing buffer
+            int garbageSkipped = 0;
+
             for (int i = 0; i < bytesRead; i++)
             {
                 _buffer.Add(buffer[i]);
             }
 
-            // Process accumulated stream bytes as long as a complete header exists
             while (_buffer.Count >= 64)
             {
-                // Get zero-allocation Span over List<byte>
                 Span<byte> bufferSpan = CollectionsMarshal.AsSpan(_buffer);
 
                 // 1. Verify S7K Protocol Version (Bytes 0-1)
                 ushort syncVerLE = BinaryPrimitives.ReadUInt16LittleEndian(bufferSpan.Slice(0, 2));
                 ushort syncVerBE = BinaryPrimitives.ReadUInt16BigEndian(bufferSpan.Slice(0, 2));
+                
+                // 2. CRITICAL FIX: Verify the S7K Sync Pattern (Bytes 4-7). Must equal 0x0000FFFF (65535)
+                uint syncPattern = BinaryPrimitives.ReadUInt32LittleEndian(bufferSpan.Slice(4, 4));
 
-                if (syncVerLE != 1 && syncVerBE != 1)
+                // If it doesn't have BOTH the version and the exact sync pattern, it's not a real header.
+                if ((syncVerLE != 1 && syncVerBE != 1) || syncPattern != 0x0000FFFF)
                 {
-                    // Discard single unaligned byte and re-sync
-                    _buffer.RemoveAt(0);
+                    _consecutiveDropCount++;
+                    garbageSkipped++;
+                    _buffer.RemoveAt(0); // Shift 1 byte and search again
                     continue;
                 }
 
-                // 2. Extract Frame Size (Bytes 8-11)
+                if (_consecutiveDropCount > 0)
+                {
+                    _diagnosticLogger?.Invoke($"[DROP] Resynchronized S7K header after dropping {_consecutiveDropCount} unaligned byte(s).");
+                    _consecutiveDropCount = 0;
+                }
+
+                // 3. Extract Frame Size (Bytes 8-11)
                 uint frameSizeBE = BinaryPrimitives.ReadUInt32BigEndian(bufferSpan.Slice(8, 4));
                 uint frameSizeLE = BinaryPrimitives.ReadUInt32LittleEndian(bufferSpan.Slice(8, 4));
                 uint frameSize = (frameSizeBE >= 64 && frameSizeBE <= 2097152) ? frameSizeBE : frameSizeLE;
 
                 if (frameSize < 64 || frameSize > 2097152)
                 {
+                    _diagnosticLogger?.Invoke($"[DROP] Invalid FrameSize: {frameSize}. Resynchronizing...");
+                    garbageSkipped++;
                     _buffer.RemoveAt(0);
                     continue;
                 }
 
-                // 3. Await complete frame payload before slicing
-                if (_buffer.Count < frameSize)
+                // 4. Await complete frame payload before slicing
+                if (_buffer.Count < (int)frameSize)
                 {
                     break;
                 }
@@ -62,15 +85,15 @@ namespace ShazrinSonar.Processing
                 byte[] completeFrame = _buffer.GetRange(0, (int)frameSize).ToArray();
                 _buffer.RemoveRange(0, (int)frameSize);
 
-                // 4. Identify Record Type ID across standard S7K and Network header offsets
                 ushort foundRecType = ExtractRecordType(completeFrame);
 
                 frames.Add((completeFrame, foundRecType));
             }
 
-            return frames;
+            return (frames, garbageSkipped);
         }
 
+        // EXACT OLD CODE LOGIC RESTORED
         private ushort ExtractRecordType(byte[] frame)
         {
             if (frame == null || frame.Length < 24) return 0;
@@ -118,6 +141,7 @@ namespace ShazrinSonar.Processing
             return 0;
         }
 
+        // EXACT OLD CODE LOGIC RESTORED
         private bool IsKnownRecordType(uint id)
         {
             return id == 7027 || id == 1012 || id == 1013 || id == 7000 || 

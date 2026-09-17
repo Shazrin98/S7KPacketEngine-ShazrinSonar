@@ -48,6 +48,7 @@ namespace ShazrinSonar.Processing
 
             if (is7027)
             {
+                // ProcessRecord7027 modifies the TWTT in-place natively via BinaryPrimitives
                 ProcessRecord7027(frame);
             }
             else if (EnableDebugLogging)
@@ -71,9 +72,8 @@ namespace ShazrinSonar.Processing
 
             Span<byte> recordData = frame.AsSpan(64);
 
-            uint pingNumber = BinaryPrimitives.ReadUInt32LittleEndian(recordData.Slice(8, 4)); // Record Header byte 8-11 (Frame byte 72-75)
-            
-            // Correct S7K Record 7027 Spec: Beam Count (N) is uint16 at Record Header offset 14 (Frame byte 78-79)
+            // EXACT OLD CODE OFFSETS RESTORED
+            uint pingNumber = BinaryPrimitives.ReadUInt32LittleEndian(recordData.Slice(8, 4));
             ushort beamCount = BinaryPrimitives.ReadUInt16LittleEndian(recordData.Slice(14, 2));
 
             // Fallback for mock or test frames
