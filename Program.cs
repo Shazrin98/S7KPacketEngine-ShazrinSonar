@@ -167,22 +167,41 @@ namespace ShazrinSonar
             }
         }
 
+        // private static void UnpackRecord7027Data(byte[] frame)
+        // {
+        //     if (frame.Length < 96) return;
+
+        //     try
+        //     {
+        //         uint pingNumber = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(64, 4));
+        //         uint beamCount = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(72, 4));
+
+        //         if (beamCount == 0 || beamCount > 2048)
+        //         {
+        //             beamCount = BinaryPrimitives.ReadUInt16LittleEndian(frame.AsSpan(72, 2));
+        //         }
+
+        //         if (pingNumber > 0) _lastPingNumber = pingNumber;
+        //         if (beamCount > 0 && beamCount <= 2048) _lastBeamCount = beamCount;
+        //     }
+        //     catch { }
+        // }
+        
         private static void UnpackRecord7027Data(byte[] frame)
         {
-            if (frame.Length < 96) return;
+            // 36 (Wrapper) + 64 (S7K Header) + 32 (Min Data) = 132 bytes
+            if (frame.Length < 132) return;
 
             try
             {
-                uint pingNumber = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(64, 4));
-                uint beamCount = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(72, 4));
+                // Absolute offsets: 100 (Record Start) + 8 = 108 (Ping Number), 114 (Beam Count)
+                uint pingNumber = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(108, 4));
+                ushort beamCount = BinaryPrimitives.ReadUInt16LittleEndian(frame.AsSpan(114, 2));
 
-                if (beamCount == 0 || beamCount > 2048)
-                {
-                    beamCount = BinaryPrimitives.ReadUInt16LittleEndian(frame.AsSpan(72, 2));
-                }
+                if (beamCount == 0 || beamCount > 2048) beamCount = 1;
 
-                if (pingNumber > 0) _lastPingNumber = pingNumber;
-                if (beamCount > 0 && beamCount <= 2048) _lastBeamCount = beamCount;
+                if (pingNumber > 0) Interlocked.Exchange(ref _lastPingNumber, pingNumber);
+                if (beamCount > 0 && beamCount <= 2048) Interlocked.Exchange(ref _lastBeamCount, beamCount);
             }
             catch { }
         }

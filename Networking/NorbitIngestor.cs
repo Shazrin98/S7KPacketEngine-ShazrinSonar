@@ -113,12 +113,12 @@ namespace ShazrinSonar.Networking
                             byte[] modifiedFrame = S7KFrameProcessor.ProcessAndModifyS7KRecord(rawFrame);
 
                             // Expected code: To forward modified data
-                            // _telemetryCallback(modifiedFrame.Length, recType, modifiedFrame);
-                            // _frameQueue.Writer.TryWrite(modifiedFrame);
+                            _telemetryCallback(modifiedFrame.Length, recType, modifiedFrame);
+                            _frameQueue.Writer.TryWrite(modifiedFrame);
 
                             // Temporary test: Forward unmodified rawFrame directly to see if process is smooth to Qinsy
-                            _telemetryCallback(rawFrame.Length, recType, rawFrame);
-                            _frameQueue.Writer.TryWrite(rawFrame);
+                            // _telemetryCallback(rawFrame.Length, recType, rawFrame);
+                            // _frameQueue.Writer.TryWrite(rawFrame);
                         }
                         // //////////////////////////////////////////////////////
                     }
