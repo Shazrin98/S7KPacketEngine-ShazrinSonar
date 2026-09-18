@@ -16,17 +16,21 @@ namespace ShazrinSonar.Processing
         public double AlongTrackX;
         public double RelativeEasting;
         public double RelativeNorthing;
+
     }
 
     public static class S7KFrameProcessor
     {
         public static HydrographicConfig Settings { get; set; } = new HydrographicConfig();
         public static bool EnableDebugLogging { get; set; } = false;
+        // Mocked inside the zone for testing
+        public static double CurrentLatitude { get; set; } = 2.925000;
+        public static double CurrentLongitude { get; set; } = 101.338000;
 
         public static byte[] ProcessAndModifyS7KRecord(byte[] frame)
         {
             if (frame == null) return Array.Empty<byte>();
-            
+
             // Total minimum length is 36 (Wrapper) + 64 (S7K Header) + 32 (Min Data) = 132 bytes
             if (frame.Length < 132) return frame;
 
@@ -50,9 +54,9 @@ namespace ShazrinSonar.Processing
             if (frame == null || frame.Length < 132) return Array.Empty<ExtractedBeamPoint>();
 
             double soundVelocity = Settings.SoundVelocity > 100.0 ? Settings.SoundVelocity : 1500.0;
-            
+
             // Skip the 36-byte wrapper and the 64-byte S7K header to reach the Record 7027 Data block
-            Span<byte> recordData = frame.AsSpan(100); 
+            Span<byte> recordData = frame.AsSpan(100);
 
             // Ping Number is at Record Header offset 8
             uint pingNumber = BinaryPrimitives.ReadUInt32LittleEndian(recordData.Slice(8, 4));
@@ -69,6 +73,10 @@ namespace ShazrinSonar.Processing
 
             var validPoints = new ExtractedBeamPoint[beamCount];
             int validBeamCount = 0;
+
+            // Evaluate Geofence Switch
+            bool insideTargetZone = GeofenceManager.IsInside(CurrentLatitude, CurrentLongitude);
+            ushort centerBeamIndex = (ushort)(beamCount / 2);
 
             for (ushort i = 0; i < beamCount; i++)
             {
@@ -98,6 +106,9 @@ namespace ShazrinSonar.Processing
                     if ((quality & Settings.MinQualityFlag) == 0) continue;
                 }
 
+                // If outside the geofence, skip modifications entirely (leaves the byte array as raw Norbit data)
+                if (!insideTargetZone) continue;
+
                 // 3D Spatial Computation
                 double slantRange = (soundVelocity * twtt) / 2.0;
                 double totalAngleRad = beamAngle + vesselRollRad;
@@ -117,6 +128,13 @@ namespace ShazrinSonar.Processing
 
                 // Overwrite TWTT directly in the frame buffer 
                 BinaryPrimitives.WriteSingleLittleEndian(recordData.Slice(currentTwttOffset, 4), depthTwttModified);
+
+                // PROOF: Log the modification of the Nadir (center) beam to verify the math
+                if (i == centerBeamIndex && EnableDebugLogging)
+                {
+                    double originalDepth = ((soundVelocity * twtt) / 2.0) * Math.Cos(beamAngle);
+                    Console.WriteLine($"[GEO-MOD ACTIVE] Beam {i} | Old Depth: {originalDepth:F2}m -> New Depth: {correctedDepthZ:F2}m");
+                }
 
                 validPoints[validBeamCount++] = new ExtractedBeamPoint
                 {
