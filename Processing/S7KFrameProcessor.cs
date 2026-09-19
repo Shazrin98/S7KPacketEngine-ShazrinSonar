@@ -155,10 +155,10 @@ namespace ShazrinSonar.Processing
                 BinaryPrimitives.WriteSingleLittleEndian(recordData.Slice(currentTwttOffset, 4), depthTwttModified);
 
                 // PROOF OF MATHEMATICS: Log the Nadir (center) beam modification to the console
-                if (i == centerBeamIndex && EnableDebugLogging)
-                {
-                    Console.WriteLine($"[GEO-MOD ACTIVE] Beam {i} | Old Depth: {depthZRaw:F2}m -> New Depth: {correctedDepthZ:F2}m");
-                }
+                // if (i == centerBeamIndex && EnableDebugLogging)
+                // {
+                //     Console.WriteLine($"[GEO-MOD ACTIVE] Beam {i} | Old Depth: {depthZRaw:F2}m -> New Depth: {correctedDepthZ:F2}m");
+                // }
 
                 validPoints[validBeamCount++] = new ExtractedBeamPoint
                 {
@@ -174,7 +174,24 @@ namespace ShazrinSonar.Processing
                     RelativeNorthing = relNorthing
                 };
             }
+            // The S7K frame size is strictly defined at byte 4 of the S7K header
+            uint s7kSize = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(syncOffset + 4, 4));
 
+            // Safety check to ensure the frame buffer actually contains the full S7K packet
+            if (syncOffset + (int)s7kSize <= frame.Length)
+            {
+                uint newChecksum = 0;
+                int checksumOffset = syncOffset + (int)s7kSize - 4;
+
+                // ONLY sum the bytes belonging to the S7K frame itself (skip the Norbit wrapper)
+                for (int i = syncOffset; i < checksumOffset; i++)
+                {
+                    newChecksum += frame[i];
+                }
+
+                // Write the new valid signature exactly where the S7K protocol expects it
+                BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(checksumOffset, 4), newChecksum);
+            }
             Array.Resize(ref validPoints, validBeamCount);
             return validPoints;
         }

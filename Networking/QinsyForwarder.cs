@@ -27,6 +27,7 @@ namespace ShazrinSonar.Networking
         {
             try
             {
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
                 socket.NoDelay = true; // Disable Nagle's algorithm for low-latency transmission
             }
             catch (Exception ex)
