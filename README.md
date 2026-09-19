@@ -21,3 +21,8 @@ dotnet build
 //
 dotnet run 
 //
+9. To create exe file for user, use git command in project directory (or copy and paste from existing):
+//
+dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
+//
+File will be found in bin\Release\net8.0\win-x64\publish\

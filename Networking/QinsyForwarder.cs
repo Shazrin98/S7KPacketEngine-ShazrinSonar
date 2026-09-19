@@ -23,11 +23,10 @@ namespace ShazrinSonar.Networking
             _logger = logger;
         }
 
-        private static void ConfigureKeepAlive(Socket socket)
+        private static void ConfigureSocketOptions(Socket socket)
         {
             try
             {
-                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
                 socket.NoDelay = true; // Disable Nagle's algorithm for low-latency transmission
             }
             catch (Exception ex)
@@ -69,7 +68,7 @@ namespace ShazrinSonar.Networking
                         try
                         {
                             using TcpClient qinsyClient = await listener.AcceptTcpClientAsync(ct);
-                            ConfigureKeepAlive(qinsyClient.Client);
+                            ConfigureSocketOptions(qinsyClient.Client);
 
                             _logger("Qinsy client connected.");
 

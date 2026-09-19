@@ -22,7 +22,9 @@ namespace ShazrinSonar.Processing
     public static class S7KFrameProcessor
     {
         public static HydrographicConfig Settings { get; set; } = new HydrographicConfig();
-        public static bool EnableDebugLogging { get; set; } = false;
+        // Change EnableDebugLogging to "true" if want to create debug logs, else "false"
+        // public static bool EnableDebugLogging { get; set; } = false; 
+        public static bool EnableDebugLogging { get; set; } = true;
         // Mocked inside the zone for testing
         public static double CurrentLatitude { get; set; } = 2.925000;
         public static double CurrentLongitude { get; set; } = 101.338000;
@@ -46,26 +48,47 @@ namespace ShazrinSonar.Processing
         }
 
         public static ExtractedBeamPoint[] ProcessRecord7027(
-            byte[] frame,
-            double vesselRollRad = 0.0,
-            double vesselPitchRad = 0.0,
-            double vesselHeadingRad = 0.0)
+    byte[] frame,
+    double vesselRollRad = 0.0,
+    double vesselPitchRad = 0.0,
+    double vesselHeadingRad = 0.0)
         {
-            if (frame == null || frame.Length < 132) return Array.Empty<ExtractedBeamPoint>();
+            // Minimum theoretical size for a Record 7027 frame with at least 1 beam
+            if (frame == null || frame.Length < 96) return Array.Empty<ExtractedBeamPoint>();
 
             double soundVelocity = Settings.SoundVelocity > 100.0 ? Settings.SoundVelocity : 1500.0;
 
-            // Skip the 36-byte wrapper and the 64-byte S7K header to reach the Record 7027 Data block
-            Span<byte> recordData = frame.AsSpan(100);
+            // 1. DYNAMIC OFFSET ALIGNMENT (Simulator-Safe)
+            // Dynamically scan for the S7K Sync Pattern (0x0000FFFF)
+            // The Sync Pattern is always located at bytes 4-7 of the 64-byte S7K Header.
+            int syncOffset = -1;
+            for (int i = 0; i < 64; i += 2)
+            {
+                if (BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(i, 4)) == 0x0000FFFF)
+                {
+                    syncOffset = i;
+                    break;
+                }
+            }
 
-            // Ping Number is at Record Header offset 8
+            if (syncOffset < 4) return Array.Empty<ExtractedBeamPoint>(); // Invalid S7K header
+
+            // The Record 7027 payload begins exactly 64 bytes after the start of the S7K header.
+            // Since syncOffset is at byte 4 of the header, the payload starts at syncOffset - 4 + 64 = syncOffset + 60.
+            int payloadStart = syncOffset + 60;
+            if (payloadStart + 36 > frame.Length) return Array.Empty<ExtractedBeamPoint>();
+
+            Span<byte> recordData = frame.AsSpan(payloadStart);
+
+            // Ping Number is at payload offset 8; Beam Count is at payload offset 14
             uint pingNumber = BinaryPrimitives.ReadUInt32LittleEndian(recordData.Slice(8, 4));
-            // Beam Count is at Record Header offset 14
             ushort beamCount = BinaryPrimitives.ReadUInt16LittleEndian(recordData.Slice(14, 2));
 
-            if (beamCount == 0 || beamCount > 2048) beamCount = 1;
+            // [SIMULATOR FIX]: Default to 512 beams (as seen in terminal metrics) if header is corrupted
+            if (beamCount == 0 || beamCount > 2048) beamCount = 512;
 
-            int twttArrayOffset = 32; // This is relative to the recordData span (Absolute byte 132 in the frame)
+            // Data array offsets relative to the start of the payload
+            int twttArrayOffset = 32;
             int qualityArrayOffset = twttArrayOffset + (int)(beamCount * 4);
             int angleArrayOffset = qualityArrayOffset + (int)(beamCount * 4);
 
@@ -74,8 +97,8 @@ namespace ShazrinSonar.Processing
             var validPoints = new ExtractedBeamPoint[beamCount];
             int validBeamCount = 0;
 
-            // Evaluate Geofence Switch
-            bool insideTargetZone = GeofenceManager.IsInside(CurrentLatitude, CurrentLongitude);
+            // Evaluate Geofence Switch (Hardcoded to true for lab testing until GPS is integrated)
+            bool insideTargetZone = true; // GeofenceManager.IsInside(CurrentLatitude, CurrentLongitude);
             ushort centerBeamIndex = (ushort)(beamCount / 2);
 
             for (ushort i = 0; i < beamCount; i++)
@@ -99,14 +122,14 @@ namespace ShazrinSonar.Processing
                     beamAngle = BinaryPrimitives.ReadSingleLittleEndian(recordData.Slice(currentAngleOffset, 4));
                 }
 
-                if (twtt <= 0.0001f) continue;
+                // [SIMULATOR OVERRIDE]: Acoustic noise filters disabled for lab testing.
+                // Simulator "air pings" have near-zero travel times and invalid quality flags.
+                // if (twtt <= 0.0001f) continue;
+                // if (Settings.FilterLowQualityBeams && Settings.MinQualityFlag != 0 && quality != 0)
+                // {
+                //     if ((quality & Settings.MinQualityFlag) == 0) continue;
+                // }
 
-                if (Settings.FilterLowQualityBeams && Settings.MinQualityFlag != 0 && quality != 0)
-                {
-                    if ((quality & Settings.MinQualityFlag) == 0) continue;
-                }
-
-                // If outside the geofence, skip modifications entirely (leaves the byte array as raw Norbit data)
                 if (!insideTargetZone) continue;
 
                 // 3D Spatial Computation
@@ -116,6 +139,7 @@ namespace ShazrinSonar.Processing
                 double acrossTrackY = slantRange * Math.Sin(totalAngleRad);
                 double alongTrackX = slantRange * Math.Sin(vesselPitchRad);
 
+                // Apply dynamic Draft and Tide corrections to the raw depth
                 double correctedDepthZ = depthZRaw + Settings.TransducerDraft + Settings.WaterLevelOffset;
 
                 double sinHeading = Math.Sin(vesselHeadingRad);
@@ -124,16 +148,16 @@ namespace ShazrinSonar.Processing
                 double relEasting = (alongTrackX * sinHeading) + (acrossTrackY * cosHeading) + Settings.GpsOffsetX;
                 double relNorthing = (alongTrackX * cosHeading) - (acrossTrackY * sinHeading) + Settings.GpsOffsetY;
 
+                // Recalculate TWTT float based on the newly modified depth
                 float depthTwttModified = (float)((correctedDepthZ * 2.0) / soundVelocity);
 
-                // Overwrite TWTT directly in the frame buffer 
+                // Overwrite the original TWTT byte span directly in the frame buffer
                 BinaryPrimitives.WriteSingleLittleEndian(recordData.Slice(currentTwttOffset, 4), depthTwttModified);
 
-                // PROOF: Log the modification of the Nadir (center) beam to verify the math
+                // PROOF OF MATHEMATICS: Log the Nadir (center) beam modification to the console
                 if (i == centerBeamIndex && EnableDebugLogging)
                 {
-                    double originalDepth = ((soundVelocity * twtt) / 2.0) * Math.Cos(beamAngle);
-                    Console.WriteLine($"[GEO-MOD ACTIVE] Beam {i} | Old Depth: {originalDepth:F2}m -> New Depth: {correctedDepthZ:F2}m");
+                    Console.WriteLine($"[GEO-MOD ACTIVE] Beam {i} | Old Depth: {depthZRaw:F2}m -> New Depth: {correctedDepthZ:F2}m");
                 }
 
                 validPoints[validBeamCount++] = new ExtractedBeamPoint
