@@ -160,6 +160,11 @@ namespace ShazrinSonar
             else if (recType == 1012 || recType == 1013 || recType == 1015 || recType == 1016 || frame.Length == 260)
             {
                 Interlocked.Increment(ref _positionFrames);
+                // Route Position data to the GPS extractor
+                if (recType == 1013)
+                {
+                    S7KFrameProcessor.ProcessRecord1003(frame);
+                }
             }
             else
             {
@@ -186,7 +191,7 @@ namespace ShazrinSonar
         //     }
         //     catch { }
         // }
-        
+
         private static void UnpackRecord7027Data(byte[] frame)
         {
             // 36 (Wrapper) + 64 (S7K Header) + 32 (Min Data) = 132 bytes

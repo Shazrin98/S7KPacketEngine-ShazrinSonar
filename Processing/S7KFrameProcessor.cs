@@ -97,8 +97,11 @@ namespace ShazrinSonar.Processing
             var validPoints = new ExtractedBeamPoint[beamCount];
             int validBeamCount = 0;
 
-            // Evaluate Geofence Switch (Hardcoded to true for lab testing until GPS is integrated)
-            bool insideTargetZone = true; // GeofenceManager.IsInside(CurrentLatitude, CurrentLongitude);
+            // Evaluate Geofence Switch (Hardcoded to true for testing)
+            // bool insideTargetZone = true;
+            // Evaluate live coordinates against the Polygon Ray-Casting algorithm
+            bool insideTargetZone = GeofenceManager.IsInsideTargetZone();
+
             ushort centerBeamIndex = (ushort)(beamCount / 2);
 
             for (ushort i = 0; i < beamCount; i++)
@@ -192,8 +195,54 @@ namespace ShazrinSonar.Processing
                 // Write the new valid signature exactly where the S7K protocol expects it
                 BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(checksumOffset, 4), newChecksum);
             }
+
             Array.Resize(ref validPoints, validBeamCount);
             return validPoints;
+        }
+
+        public static void ProcessRecord1003(byte[] frame)
+        {
+            // Minimum frame size guard (64-byte header + 32-byte minimum payload)
+            if (frame == null || frame.Length < 96) return;
+
+            // 1. DYNAMIC OFFSET ALIGNMENT
+            // Safely locate the S7K Sync Pattern (0x0000FFFF) to bypass prepended network wrappers
+            int syncOffset = -1;
+            for (int i = 0; i < 64; i += 2)
+            {
+                if (BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(i, 4)) == 0x0000FFFF)
+                {
+                    syncOffset = i;
+                    break;
+                }
+            }
+
+            if (syncOffset < 4) return; // Invalid or missing S7K header
+
+            // 2. NAVIGATE TO PAYLOAD
+            // The Record 1003 payload begins exactly 64 bytes after the start of the S7K header
+            // (syncOffset is byte 4 of the header: syncOffset - 4 + 64 = syncOffset + 60)
+            int payloadStart = syncOffset + 60;
+
+            // Ensure the buffer is large enough to read up to the Longitude double (ends at offset 24)
+            if (payloadStart + 24 > frame.Length) return;
+
+            Span<byte> recordData = frame.AsSpan(payloadStart);
+
+            // 3. EXTRACT COORDINATES
+            // In standard S7K Record 1003, Latitude is at offset 8, Longitude is at offset 16 (64-bit doubles)
+            double latRadians = BinaryPrimitives.ReadDoubleLittleEndian(recordData.Slice(8, 8));
+            double lonRadians = BinaryPrimitives.ReadDoubleLittleEndian(recordData.Slice(16, 8));
+
+            // 4. CONVERT TO DECIMAL DEGREES
+            double latDegrees = latRadians * (180.0 / Math.PI);
+            double lonDegrees = lonRadians * (180.0 / Math.PI);
+
+            // 5. UPDATE GEOFENCE STATE
+            GeofenceManager.UpdatePosition(latDegrees, lonDegrees);
+
+            // To see the GPS Lock during testing
+            Console.WriteLine($"[GPS Lock] {latDegrees:F6}, {lonDegrees:F6}");
         }
     }
 }
