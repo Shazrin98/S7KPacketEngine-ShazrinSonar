@@ -136,15 +136,43 @@ namespace ShazrinSonar
         private static void LoadConfiguration()
         {
             var cfg = Config;
+            ApplyConfigUpdate(cfg);
 
+            // [NEW] Re-attach the live reload event to ensure Geofence & Offsets 
+            // update immediately when the user saves ShazrinSonar_Config.json
+            _configManager.OnConfigReloaded += (newConfig) =>
+            {
+                ApplyConfigUpdate(newConfig);
+                LogDiagnostic($"[CONFIG] Live Reload: Offset={newConfig.TargetDepthOffset}m, Polygon Points={newConfig.GeofencePolygon.Count}");
+            };
+        }
+
+        private static void ApplyConfigUpdate(AppSettings cfg)
+        {
+            // 1. Update the math engine settings, passing the new TargetDepthOffset
             S7KFrameProcessor.Settings = new HydrographicConfig
             {
                 SoundVelocity = cfg.SoundVelocity,
                 TransducerDraft = cfg.TransducerDraft,
                 WaterLevelOffset = cfg.WaterLevelOffset,
+                GpsOffsetX = cfg.GpsOffsetX,
+                GpsOffsetY = cfg.GpsOffsetY,
                 FilterLowQualityBeams = cfg.FilterLowQualityBeams,
-                MinQualityFlag = cfg.MinQualityFlag
+                MinQualityFlag = cfg.MinQualityFlag,
+                TargetDepthOffset = cfg.TargetDepthOffset // Inject targeted offset
             };
+
+            // 2. Extract JSON GeoCoordinates and push to the thread-safe GeofenceManager
+            if (cfg.GeofencePolygon != null)
+            {
+                var polygonTuples = new (double Lat, double Lon)[cfg.GeofencePolygon.Count];
+                for (int i = 0; i < cfg.GeofencePolygon.Count; i++)
+                {
+                    polygonTuples[i] = (cfg.GeofencePolygon[i].Lat, cfg.GeofencePolygon[i].Lon);
+                }
+                
+                GeofenceManager.SetPolygon(polygonTuples);
+            }
         }
 
         private static void HandleFrameTelemetry(int bytesRead, ushort recType, byte[] frame)

@@ -1,10 +1,17 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
 using System.Threading;
 
 namespace ShazrinSonar.Config
 {
+    public class GeoCoordinate
+    {
+        public double Lat { get; set; }
+        public double Lon { get; set; }
+    }
+
     public class AppSettings
     {
         // Network Settings
@@ -22,6 +29,14 @@ namespace ShazrinSonar.Config
         public bool FilterLowQualityBeams { get; set; } = true;
         public ushort MinQualityFlag { get; set; } = 0x01;
 
+        // Targeted Depth Manipulation
+        // Positive values push the seafloor deeper; Negative values pull the seafloor shallower.
+        public double TargetDepthOffset { get; set; } = 0.0;
+
+        // Dynamic Geofence Polygon
+        // Allows users to define 3+ points to create an active spoofing zone.
+        public List<GeoCoordinate> GeofencePolygon { get; set; } = new List<GeoCoordinate>();
+
         // Security Settings
         public string AuthorizedLicenseKey { get; set; } = "SHAZRIN-HWID-DEMO-KEY";
 
@@ -36,7 +51,8 @@ namespace ShazrinSonar.Config
                 GpsOffsetX = GpsOffsetX,
                 GpsOffsetY = GpsOffsetY,
                 FilterLowQualityBeams = FilterLowQualityBeams,
-                MinQualityFlag = MinQualityFlag
+                MinQualityFlag = MinQualityFlag,
+                TargetDepthOffset = TargetDepthOffset // Pass the new variable
             };
         }
     }
@@ -50,6 +66,9 @@ namespace ShazrinSonar.Config
         public double GpsOffsetY { get; set; } = 1.50;         // GPS to Transducer Bow/Stern offset (m)
         public bool FilterLowQualityBeams { get; set; } = true;
         public ushort MinQualityFlag { get; set; } = 0x01;     // Bit 0 = Valid Detection
+
+        // Carried over to the processing engine
+        public double TargetDepthOffset { get; set; } = 0.0;
     }
 
     public class ConfigManager : IDisposable

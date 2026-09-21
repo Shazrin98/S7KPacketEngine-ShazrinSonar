@@ -1,28 +1,34 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace ShazrinSonar.Processing
 {
     public static class GeofenceManager
     {
         // Thread-safe storage for the vessel's last known live location
-        // These are updated continuously by the Record 1003 parser
         private static double _currentLatitude = 0.0;
         private static double _currentLongitude = 0.0;
         private static readonly object _lock = new object();
 
-        // Polygon vertices converted from DMS to Decimal Degrees
-        // Supports any number of points (3+) for complex, irregular survey areas
-        private static readonly (double Lat, double Lon)[] Polygon = new[]
+        // Dynamic polygon backing field
+        // Starts empty. Populated via JSON config injection.
+        private static (double Lat, double Lon)[] _polygon = Array.Empty<(double, double)>();
+
+        /// <summary>
+        /// Updates the polygon vertices dynamically. 
+        /// Thread-safe to prevent race conditions with incoming ping processing.
+        /// </summary>
+        public static void SetPolygon(IEnumerable<(double Lat, double Lon)> vertices)
         {
-            (2.928072, 101.335228), // A. 2°55'41.06"N 101°20'06.82"E
-            (2.920997, 101.339667), // B. 2°55'15.59"N 101°20'22.80"E
-            (2.923997, 101.342856), // C. 2°55'26.39"N 101°20'34.28"E
-            (2.929503, 101.339189)  // D. 2°55'46.21"N 101°20'21.08"E
-        };
+            lock (_lock)
+            {
+                _polygon = vertices.ToArray();
+            }
+        }
 
         /// <summary>
         /// Updates the vessel's live position in memory. 
-        /// Called automatically every time a new Record 1003 arrives.
         /// </summary>
         public static void UpdatePosition(double latitude, double longitude)
         {
@@ -35,38 +41,43 @@ namespace ShazrinSonar.Processing
 
         /// <summary>
         /// Evaluates if the last known GPS position is inside the defined polygon.
-        /// Called by the Record 7027 processor for every ping.
         /// </summary>
         public static bool IsInsideTargetZone()
         {
             double currentLat;
             double currentLon;
+            (double Lat, double Lon)[] poly;
 
+            // Safely copy references before executing math to prevent crashes
+            // if the config file is reloaded exactly while a ping is being processed.
             lock (_lock)
             {
                 currentLat = _currentLatitude;
                 currentLon = _currentLongitude;
+                poly = _polygon; 
             }
 
-            // Failsafe: If no GPS data has been received yet, disable modifications
+            // Failsafes: Disable spoofing if no GPS data exists yet
             if (currentLat == 0.0 && currentLon == 0.0) return false;
+            
+            // Failsafe: A valid polygon mathematically requires at least 3 points
+            if (poly.Length < 3) return false; 
 
             // Ray-Casting Algorithm: Determines if a point is inside a polygon
             // by drawing a horizontal line and counting edge intersections.
             bool isInside = false;
-            int j = Polygon.Length - 1; // Start with the last vertex to close the loop
+            int j = poly.Length - 1; // Start with the last vertex to close the loop
 
-            for (int i = 0; i < Polygon.Length; i++)
+            for (int i = 0; i < poly.Length; i++)
             {
                 // Check if the current point's Longitude falls between the Longitudes of the edge (i, j)
-                if ((Polygon[i].Lon < currentLon && Polygon[j].Lon >= currentLon) ||
-                    (Polygon[j].Lon < currentLon && Polygon[i].Lon >= currentLon))
+                if ((poly[i].Lon < currentLon && poly[j].Lon >= currentLon) ||
+                    (poly[j].Lon < currentLon && poly[i].Lon >= currentLon))
                 {
                     // Calculate the Latitude of the intersection point on the edge.
-                    // If the vessel's Latitude is below this intersection, the ray crosses the edge.
-                    if (Polygon[i].Lat + (currentLon - Polygon[i].Lon) /
-                        (Polygon[j].Lon - Polygon[i].Lon) *
-                        (Polygon[j].Lat - Polygon[i].Lat) < currentLat)
+                    if (poly[i].Lat + (currentLon - poly[i].Lon) /
+                        (poly[j].Lon - poly[i].Lon) *
+                        (poly[j].Lat - poly[i].Lat) < currentLat)
                     {
                         isInside = !isInside; // Toggle state (Odd = Inside, Even = Outside)
                     }
