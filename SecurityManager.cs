@@ -77,11 +77,16 @@ namespace ShazrinSonar
             // Write host HWID to local file on first boot for easy setup
             try 
             { 
-                File.WriteAllText(licenseFile, currentHwid); 
+                // This line is to write host HWID to local file on first boot for easy setup
+                // File.WriteAllText(licenseFile, currentHwid); 
+
+                // This line is to write host HWID to local file for reference, but DO NOT grant access
+                File.WriteAllText("Your_Hardware_ID.txt", $"Provide this ID to your developer to receive a license key:\n{currentHwid}");
             } 
             catch { }
 
-            return true;
+            // Hard-lock the application with "false". Use "true" for testing without license.
+            return false;
         }
     }
 }

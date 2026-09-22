@@ -76,15 +76,32 @@ namespace ShazrinSonar
 
         static async Task Main(string[] args)
         {
+            // Developer-Only Provisioning Backdoor
+            // Run via terminal: ShazrinSonar.exe --provision ShafiqNazrinSonar2026
+            if (args.Length == 2 && args[0] == "--provision" && args[1] == "ShafiqNazrinSonar2026")
+            {
+                string hwid = SecurityManager.GenerateHardwareId();
+                File.WriteAllText("ShazrinSonar.lic", hwid);
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[+] DEVELOPER OVERRIDE: Machine successfully licensed for HWID: {hwid}");
+                Console.WriteLine("You may now close this window and double-click the application to run it normally.");
+                Console.ResetColor();
+                return;
+            }
+
             LoadConfiguration();
             EnableAnsiTerminal();
 
+            // If no license key found
             if (!SecurityManager.ValidateAuthorization(Config.AuthorizedLicenseKey))
             {
                 Console.ForegroundColor = ConsoleColor.Red;
                 Console.WriteLine("\n[!] ACCESS DENIED: Unauthorized hardware device or missing ShazrinSonar.lic key.");
                 Console.WriteLine($"[!] Hardware Fingerprint: {SecurityManager.GenerateHardwareId()}");
+                Console.WriteLine("\nPlease check the 'Your_Hardware_ID.txt' file and send this Fingerprint to your administrator.");
+                Console.WriteLine("Press [ENTER] to exit...");
                 Console.ResetColor();
+                Console.ReadLine(); // Halts execution so the window stays open for the user to read
                 return;
             }
 
@@ -138,7 +155,7 @@ namespace ShazrinSonar
             var cfg = Config;
             ApplyConfigUpdate(cfg);
 
-            // [NEW] Re-attach the live reload event to ensure Geofence & Offsets 
+            // Re-attach the live reload event to ensure Geofence & Offsets 
             // update immediately when the user saves ShazrinSonar_Config.json
             _configManager.OnConfigReloaded += (newConfig) =>
             {
@@ -170,7 +187,7 @@ namespace ShazrinSonar
                 {
                     polygonTuples[i] = (cfg.GeofencePolygon[i].Lat, cfg.GeofencePolygon[i].Lon);
                 }
-                
+
                 GeofenceManager.SetPolygon(polygonTuples);
             }
         }
