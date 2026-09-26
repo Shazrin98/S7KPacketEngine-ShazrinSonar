@@ -1,64 +1,56 @@
 using System;
 using System.Buffers.Binary;
+using System.IO;
 using ShazrinSonar.Config;
 
 namespace ShazrinSonar.Processing
 {
-    public struct ExtractedBeamPoint
-    {
-        public ushort BeamIndex;
-        public float Twtt;
-        public float BeamAngleRad;
-        public uint Quality;
-        public double SlantRange;
-        public double CorrectedDepthZ;
-        public double AcrossTrackY;
-        public double AlongTrackX;
-        public double RelativeEasting;
-        public double RelativeNorthing;
-    }
-
     public static class S7KFrameProcessor
     {
         public static HydrographicConfig Settings { get; set; } = new HydrographicConfig();
-        
-        // Change EnableDebugLogging to "true" if want to create debug logs, else "false"
-        public static bool EnableDebugLogging { get; set; } = true;
+        public static bool EnableDebugLogging { get; set; } = false;
+
+        private static int _pingCounter = 0;
+        private static readonly object _logLock = new object();
+
+        private static void SafeLog(string message)
+        {
+            try
+            {
+                lock (_logLock)
+                {
+                    using var stream = new FileStream("angle_diagnostics.log", FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                    using var writer = new StreamWriter(stream);
+                    writer.WriteLine(message);
+                }
+            }
+            catch { } // Prevent logging exceptions from crashing the pipeline
+        }
 
         public static byte[] ProcessAndModifyS7KRecord(byte[] frame)
         {
-            if (frame == null) return Array.Empty<byte>();
+            if (frame == null || frame.Length < 132) return frame ?? Array.Empty<byte>();
 
-            // Total minimum length is 36 (Wrapper) + 64 (S7K Header) + 32 (Min Data) = 132 bytes
-            if (frame.Length < 132) return frame;
-
-            // Extract Record Type from the inner S7K header (Byte 68)
             uint recType32 = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(68, 4));
 
             if (recType32 == 7027)
             {
                 ProcessRecord7027(frame);
             }
+            else if (recType32 == 1013) // Assuming 1013 handles geofence parsing
+            {
+                ProcessRecord1003(frame);
+            }
 
             return frame;
         }
 
-        public static ExtractedBeamPoint[] ProcessRecord7027(
-            byte[] frame,
-            double vesselRollRad = 0.0,
-            double vesselPitchRad = 0.0,
-            double vesselHeadingRad = 0.0)
+        private static void ProcessRecord7027(byte[] frame)
         {
-            // Minimum theoretical size for a Record 7027 frame with at least 1 beam
-            if (frame == null || frame.Length < 96) return Array.Empty<ExtractedBeamPoint>();
-
-            double soundVelocity = Settings.SoundVelocity > 100.0 ? Settings.SoundVelocity : 1500.0;
-
-            // 1. DYNAMIC OFFSET ALIGNMENT (Simulator-Safe)
-            // Dynamically scan for the S7K Sync Pattern (0x0000FFFF)
-            // The Sync Pattern is always located at bytes 4-7 of the 64-byte S7K Header.
             int syncOffset = -1;
-            for (int i = 0; i < 64; i += 2)
+            
+            // 1. Locate S7K Sync Header
+            for (int i = 0; i < frame.Length - 4; i++)
             {
                 if (BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(i, 4)) == 0x0000FFFF)
                 {
@@ -67,133 +59,87 @@ namespace ShazrinSonar.Processing
                 }
             }
 
-            if (syncOffset < 4) return Array.Empty<ExtractedBeamPoint>(); // Invalid S7K header
+            if (syncOffset < 4) return;
 
-            // The Record 7027 payload begins exactly 64 bytes after the start of the S7K header.
-            // Since syncOffset is at byte 4 of the header, the payload starts at syncOffset - 4 + 64 = syncOffset + 60.
-            int payloadStart = syncOffset + 60;
-            if (payloadStart + 36 > frame.Length) return Array.Empty<ExtractedBeamPoint>();
+            int frameStart = syncOffset - 4;
+            uint s7kSize = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(frameStart + 8, 4));
+            
+            if (frameStart + (int)s7kSize > frame.Length) return;
 
+            int payloadStart = frameStart + 64;
             Span<byte> recordData = frame.AsSpan(payloadStart);
 
-            // Ping Number is at payload offset 8; Beam Count is at payload offset 14
-            uint pingNumber = BinaryPrimitives.ReadUInt32LittleEndian(recordData.Slice(8, 4));
             ushort beamCount = BinaryPrimitives.ReadUInt16LittleEndian(recordData.Slice(14, 2));
+            if (beamCount == 0 || beamCount > 2048) return;
 
-            // Default to 512 beams (as seen in terminal metrics) if header is corrupted
-            if (beamCount == 0 || beamCount > 2048) beamCount = 512;
+            float liveSoundVelocity = BinaryPrimitives.ReadSingleLittleEndian(recordData.Slice(20, 4));
+            if (liveSoundVelocity < 1000f || liveSoundVelocity > 1650f) liveSoundVelocity = 1500f;
 
-            // Data array offsets relative to the start of the payload
-            int twttArrayOffset = 32;
-            int qualityArrayOffset = twttArrayOffset + (int)(beamCount * 4);
-            int angleArrayOffset = qualityArrayOffset + (int)(beamCount * 4);
+            int arrayStartOffset = 87;
 
-            if (recordData.Length < twttArrayOffset + 4) return Array.Empty<ExtractedBeamPoint>();
-
-            var validPoints = new ExtractedBeamPoint[beamCount];
-            int validBeamCount = 0;
-
-            // Evaluate live coordinates against the Polygon Ray-Casting algorithm
-            bool insideTargetZone = GeofenceManager.IsInsideTargetZone();
-
-            ushort centerBeamIndex = (ushort)(beamCount / 2);
-
-            for (ushort i = 0; i < beamCount; i++)
+            if (Settings.TargetDepthOffset != 0 && GeofenceManager.IsInsideTargetZone())
             {
-                int currentTwttOffset = twttArrayOffset + (i * 4);
-                if (currentTwttOffset + 4 > recordData.Length) break;
+                _pingCounter++;
+                bool logThisPing = (_pingCounter % 50 == 0);
 
-                float twtt = BinaryPrimitives.ReadSingleLittleEndian(recordData.Slice(currentTwttOffset, 4));
-
-                uint quality = 0x01;
-                int currentQualityOffset = qualityArrayOffset + (i * 4);
-                if (currentQualityOffset + 4 <= recordData.Length)
+                if (logThisPing)
                 {
-                    quality = BinaryPrimitives.ReadUInt32LittleEndian(recordData.Slice(currentQualityOffset, 4));
+                    SafeLog($"\n--- PING {_pingCounter} MODIFICATION TRACKER ---");
                 }
 
-                float beamAngle = 0.0f;
-                int currentAngleOffset = angleArrayOffset + (i * 4);
-                if (currentAngleOffset + 4 <= recordData.Length)
+                for (ushort i = 0; i < beamCount; i++)
                 {
-                    beamAngle = BinaryPrimitives.ReadSingleLittleEndian(recordData.Slice(currentAngleOffset, 4));
+                    int currentBeamStructStart = arrayStartOffset + (i * 26);
+                    if (currentBeamStructStart + 26 > recordData.Length) break;
+
+                    int twttOffset = currentBeamStructStart + 4;
+                    int sampleOffset = currentBeamStructStart + 14;
+                    int angleOffset = currentBeamStructStart + 18;
+
+                    float twtt = BinaryPrimitives.ReadSingleLittleEndian(recordData.Slice(twttOffset, 4));
+                    
+                    // Skip dropped/invalid beams to prevent math errors (e.g., Beam 0)
+                    if (twtt <= 0.0001f) continue;
+
+                    float beamAngleRad = BinaryPrimitives.ReadSingleLittleEndian(recordData.Slice(angleOffset, 4));
+                    float cleanRad = beamAngleRad;
+                    if (cleanRad < -3.1416f || cleanRad > 3.1416f || float.IsNaN(cleanRad))
+                    {
+                        cleanRad = 0f;
+                    }
+
+                    double cosAngle = Math.Cos(cleanRad);
+                    if (cosAngle < 0.087) cosAngle = 0.087;
+
+                    // Calculate Depth Addition
+                    double extraTwtt = (Settings.TargetDepthOffset * 2.0) / (liveSoundVelocity * cosAngle);
+                    float modifiedTwtt = twtt + (float)extraTwtt;
+
+                    // Qinsy High-Precision Fallback: Scale the sub-sample index proportionally
+                    float originalSample = BinaryPrimitives.ReadSingleLittleEndian(recordData.Slice(sampleOffset, 4));
+                    float modifiedSample = originalSample * (modifiedTwtt / twtt);
+
+                    if (logThisPing && (i == 256 || i == 511))
+                    {
+                        SafeLog($"Beam {i,-3} | TWTT: {twtt,7:F5} -> {modifiedTwtt,7:F5} | Sample: {originalSample,7:F1} -> {modifiedSample,7:F1}");
+                    }
+
+                    // Overwrite both fields in the byte array
+                    BinaryPrimitives.WriteSingleLittleEndian(recordData.Slice(twttOffset, 4), modifiedTwtt);
+                    BinaryPrimitives.WriteSingleLittleEndian(recordData.Slice(sampleOffset, 4), modifiedSample);
                 }
 
-                // If outside the active geofence polygon, skip modifying this ping entirely
-                if (!insideTargetZone) continue;
-
-                // 3D Spatial Computation
-                double slantRange = (soundVelocity * twtt) / 2.0;
-                double totalAngleRad = beamAngle + vesselRollRad;
-                double depthZRaw = slantRange * Math.Cos(totalAngleRad) * Math.Cos(vesselPitchRad);
-                double acrossTrackY = slantRange * Math.Sin(totalAngleRad);
-                double alongTrackX = slantRange * Math.Sin(vesselPitchRad);
-
-                // Apply dynamic Draft and Tide corrections to the raw depth
-                double correctedDepthZ = depthZRaw + Settings.TransducerDraft + Settings.WaterLevelOffset;
-
-                // Positive = deeper seafloor, Negative = shallower seafloor. Only executes if insideTargetZone is true.
-                correctedDepthZ += Settings.TargetDepthOffset;
-
-                double sinHeading = Math.Sin(vesselHeadingRad);
-                double cosHeading = Math.Cos(vesselHeadingRad);
-
-                double relEasting = (alongTrackX * sinHeading) + (acrossTrackY * cosHeading) + Settings.GpsOffsetX;
-                double relNorthing = (alongTrackX * cosHeading) - (acrossTrackY * sinHeading) + Settings.GpsOffsetY;
-
-                // Recalculate TWTT float based on the newly modified depth
-                float depthTwttModified = (float)((correctedDepthZ * 2.0) / soundVelocity);
-
-                // Overwrite the original TWTT byte span directly in the frame buffer
-                BinaryPrimitives.WriteSingleLittleEndian(recordData.Slice(currentTwttOffset, 4), depthTwttModified);
-
-                validPoints[validBeamCount++] = new ExtractedBeamPoint
-                {
-                    BeamIndex = i,
-                    Twtt = depthTwttModified,
-                    BeamAngleRad = beamAngle,
-                    Quality = quality,
-                    SlantRange = slantRange,
-                    CorrectedDepthZ = correctedDepthZ,
-                    AcrossTrackY = acrossTrackY,
-                    AlongTrackX = alongTrackX,
-                    RelativeEasting = relEasting,
-                    RelativeNorthing = relNorthing
-                };
+                // Keep the hardware's original bypass behavior (0)
+                int checksumOffset = frameStart + (int)s7kSize - 4;
+                BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(checksumOffset, 4), 0);
             }
-            
-            // The S7K frame size is strictly defined at byte 4 of the S7K header
-            uint s7kSize = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(syncOffset + 4, 4));
-
-            // Safety check to ensure the frame buffer actually contains the full S7K packet
-            if (syncOffset + (int)s7kSize <= frame.Length)
-            {
-                uint newChecksum = 0;
-                int checksumOffset = syncOffset + (int)s7kSize - 4;
-
-                // ONLY sum the bytes belonging to the S7K frame itself (skip the Norbit wrapper)
-                for (int i = syncOffset; i < checksumOffset; i++)
-                {
-                    newChecksum += frame[i];
-                }
-
-                // Write the new valid signature exactly where the S7K protocol expects it
-                BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(checksumOffset, 4), newChecksum);
-            }
-
-            Array.Resize(ref validPoints, validBeamCount);
-            return validPoints;
         }
 
         public static void ProcessRecord1003(byte[] frame)
         {
-            // Minimum frame size guard (64-byte header + 32-byte minimum payload)
-            if (frame == null || frame.Length < 96) return;
-
-            // 1. DYNAMIC OFFSET ALIGNMENT
-            // Safely locate the S7K Sync Pattern (0x0000FFFF) to bypass prepended network wrappers
             int syncOffset = -1;
-            for (int i = 0; i < 64; i += 2)
+
+            for (int i = 0; i < frame.Length - 4; i++)
             {
                 if (BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(i, 4)) == 0x0000FFFF)
                 {
@@ -202,32 +148,22 @@ namespace ShazrinSonar.Processing
                 }
             }
 
-            if (syncOffset < 4) return; // Invalid or missing S7K header
+            if (syncOffset < 4) return;
 
-            // 2. NAVIGATE TO PAYLOAD
-            // The Record 1003 payload begins exactly 64 bytes after the start of the S7K header
-            // (syncOffset is byte 4 of the header: syncOffset - 4 + 64 = syncOffset + 60)
-            int payloadStart = syncOffset + 60;
+            // CORRECTED: Apply the same true frame start logic to prevent geofence data drops
+            int frameStart = syncOffset - 4;
+            int payloadStart = frameStart + 64;
 
-            // Ensure the buffer is large enough to read up to the Longitude double (ends at offset 24)
             if (payloadStart + 24 > frame.Length) return;
 
             Span<byte> recordData = frame.AsSpan(payloadStart);
-
-            // 3. EXTRACT COORDINATES
-            // In standard S7K Record 1003, Latitude is at offset 8, Longitude is at offset 16 (64-bit doubles)
             double latRadians = BinaryPrimitives.ReadDoubleLittleEndian(recordData.Slice(8, 8));
             double lonRadians = BinaryPrimitives.ReadDoubleLittleEndian(recordData.Slice(16, 8));
 
-            // 4. CONVERT TO DECIMAL DEGREES
             double latDegrees = latRadians * (180.0 / Math.PI);
             double lonDegrees = lonRadians * (180.0 / Math.PI);
 
-            // 5. UPDATE GEOFENCE STATE
             GeofenceManager.UpdatePosition(latDegrees, lonDegrees);
-
-            // To see the GPS Lock during testing
-            Console.WriteLine($"[GPS Lock] {latDegrees:F6}, {lonDegrees:F6}");
         }
     }
 }

@@ -57,6 +57,9 @@ namespace ShazrinSonar.Processing
                 poly = _polygon; 
             }
 
+            // For testing without geofence, return true and comment out everything else below it
+            // return true;
+
             // Failsafes: Disable spoofing if no GPS data exists yet
             if (currentLat == 0.0 && currentLon == 0.0) return false;
             

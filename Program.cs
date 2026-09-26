@@ -166,20 +166,11 @@ namespace ShazrinSonar
 
         private static void ApplyConfigUpdate(AppSettings cfg)
         {
-            // 1. Update the math engine settings, passing the new TargetDepthOffset
             S7KFrameProcessor.Settings = new HydrographicConfig
             {
-                SoundVelocity = cfg.SoundVelocity,
-                TransducerDraft = cfg.TransducerDraft,
-                WaterLevelOffset = cfg.WaterLevelOffset,
-                GpsOffsetX = cfg.GpsOffsetX,
-                GpsOffsetY = cfg.GpsOffsetY,
-                FilterLowQualityBeams = cfg.FilterLowQualityBeams,
-                MinQualityFlag = cfg.MinQualityFlag,
-                TargetDepthOffset = cfg.TargetDepthOffset // Inject targeted offset
+                TargetDepthOffset = cfg.TargetDepthOffset
             };
 
-            // 2. Extract JSON GeoCoordinates and push to the thread-safe GeofenceManager
             if (cfg.GeofencePolygon != null)
             {
                 var polygonTuples = new (double Lat, double Lon)[cfg.GeofencePolygon.Count];
@@ -187,7 +178,6 @@ namespace ShazrinSonar
                 {
                     polygonTuples[i] = (cfg.GeofencePolygon[i].Lat, cfg.GeofencePolygon[i].Lon);
                 }
-
                 GeofenceManager.SetPolygon(polygonTuples);
             }
         }
@@ -281,10 +271,8 @@ namespace ShazrinSonar
                     sb.AppendLine($"[+] Target (Qinsy Server) : Port {Config.TargetPort} ({Config.TargetProtocol})");
                     sb.AppendLine("--------------------------------------------------");
                     sb.AppendLine("[+] HYDROGRAPHIC CONFIGURATION");
-                    sb.AppendLine($"    ├── Sound Velocity    : {S7KFrameProcessor.Settings.SoundVelocity:F1} m/s");
-                    sb.AppendLine($"    ├── Transducer Draft  : +{S7KFrameProcessor.Settings.TransducerDraft:F2} m");
-                    sb.AppendLine($"    ├── Water Level/Tide  : {S7KFrameProcessor.Settings.WaterLevelOffset:+0.00;-0.00;0.00} m");
-                    sb.AppendLine($"    └── Quality Filter    : {(S7KFrameProcessor.Settings.FilterLowQualityBeams ? "ENABLED" : "DISABLED")}");
+                    sb.AppendLine($"    ├── Target Depth Offset: {S7KFrameProcessor.Settings.TargetDepthOffset:+0.00;-0.00;0.00} m");
+                    sb.AppendLine($"    └── Geofence Status    : {(GeofenceManager.IsInsideTargetZone() ? "INSIDE (Spoofing Active)" : "OUTSIDE")}");
                     sb.AppendLine("--------------------------------------------------");
                     sb.AppendLine($"[+] STREAM METRICS");
                     sb.AppendLine($"    ├── Raw Ingested Data : {mbIngested:F2} MB");

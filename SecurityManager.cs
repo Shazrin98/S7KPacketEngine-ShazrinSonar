@@ -14,11 +14,14 @@ namespace ShazrinSonar
         {
             try
             {
-                // 1. Get primary physical Network Interface MAC Address (Cross-Platform)
+                // 1. Get primary physical Network Interface MAC Address (Stable, ignores current connection status)
                 string primaryMac = NetworkInterface.GetAllNetworkInterfaces()
-                    .Where(nic => nic.OperationalStatus == OperationalStatus.Up &&
-                                  nic.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
-                                  nic.NetworkInterfaceType != NetworkInterfaceType.Tunnel)
+                    .Where(nic => nic.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
+                                  nic.NetworkInterfaceType != NetworkInterfaceType.Tunnel &&
+                                  !nic.Description.ToLower().Contains("virtual") &&
+                                  !nic.Description.ToLower().Contains("pseudo"))
+                    // Prioritize physical Ethernet, then Wireless
+                    .OrderBy(nic => nic.NetworkInterfaceType == NetworkInterfaceType.Ethernet ? 0 : 1)
                     .Select(nic => nic.GetPhysicalAddress().ToString())
                     .FirstOrDefault(mac => !string.IsNullOrEmpty(mac) && mac != "000000000000") 
                     ?? "SHAZRIN-GENERIC-MAC";
@@ -38,20 +41,28 @@ namespace ShazrinSonar
         }
 
         /// Validates offline license authorization via local .lic file or removable USB drive.
-        /// Return "true" or "false" to test authorization
         public static bool ValidateAuthorization(string expectedKey)
         {
             string currentHwid = GenerateHardwareId();
-            string licenseFile = "ShazrinSonar.lic";
+            string fileName = "ShazrinSonar.lic";
 
-            // 1. Check local .lic file in working directory
-            if (File.Exists(licenseFile))
+            // Check both the directory where the EXE lives, and the current working directory
+            string[] searchPaths = {
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, fileName),
+                Path.Combine(Environment.CurrentDirectory, fileName)
+            };
+
+            // 1. Check local .lic files
+            foreach (string licensePath in searchPaths)
             {
-                string licContent = File.ReadAllText(licenseFile).Trim();
-                if (licContent.Equals(currentHwid, StringComparison.OrdinalIgnoreCase) || 
-                    licContent.Equals(expectedKey, StringComparison.OrdinalIgnoreCase))
+                if (File.Exists(licensePath))
                 {
-                    return true;
+                    string licContent = File.ReadAllText(licensePath).Trim();
+                    if (licContent.Equals(currentHwid, StringComparison.OrdinalIgnoreCase) || 
+                        licContent.Equals(expectedKey, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
                 }
             }
 
@@ -60,7 +71,7 @@ namespace ShazrinSonar
             {
                 foreach (var drive in DriveInfo.GetDrives().Where(d => d.DriveType == DriveType.Removable && d.IsReady))
                 {
-                    string usbLicPath = Path.Combine(drive.RootDirectory.FullName, "ShazrinSonar.lic");
+                    string usbLicPath = Path.Combine(drive.RootDirectory.FullName, fileName);
                     if (File.Exists(usbLicPath))
                     {
                         string usbContent = File.ReadAllText(usbLicPath).Trim();
@@ -74,18 +85,15 @@ namespace ShazrinSonar
             }
             catch { }
 
-            // Write host HWID to local file on first boot for easy setup
+            // Write host HWID to local file so you know exactly what ID it is expecting
             try 
             { 
-                // This line is to write host HWID to local file on first boot for easy setup
-                // File.WriteAllText(licenseFile, currentHwid); 
-
-                // This line is to write host HWID to local file for reference, but DO NOT grant access
-                File.WriteAllText("Your_Hardware_ID.txt", $"Provide this ID to your developer to receive a license key:\n{currentHwid}");
+                string outputTxt = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Your_Hardware_ID.txt");
+                File.WriteAllText(outputTxt, $"Provide this ID to your developer to receive a license key:\n{currentHwid}");
             } 
             catch { }
 
-            // Hard-lock the application with "false". Use "true" for testing without license.
+            // Hard-lock the application to enforce the license check
             return false;
         }
     }
