@@ -7,7 +7,7 @@ namespace ShazrinSonar.Processing
 {
     public static class S7KFrameProcessor
     {
-        public static HydrographicConfig Settings { get; set; } = new HydrographicConfig();
+        public static double TargetDepthOffset { get; set; } = 0.0;
         public static bool EnableDebugLogging { get; set; } = false;
 
         private static int _pingCounter = 0;
@@ -77,7 +77,7 @@ namespace ShazrinSonar.Processing
 
             int arrayStartOffset = 87;
 
-            if (Settings.TargetDepthOffset != 0 && GeofenceManager.IsInsideTargetZone())
+            if (TargetDepthOffset != 0 && GeofenceManager.IsInsideTargetZone())
             {
                 _pingCounter++;
                 bool logThisPing = (_pingCounter % 50 == 0);
@@ -112,7 +112,7 @@ namespace ShazrinSonar.Processing
                     if (cosAngle < 0.087) cosAngle = 0.087;
 
                     // Calculate Depth Addition
-                    double extraTwtt = (Settings.TargetDepthOffset * 2.0) / (liveSoundVelocity * cosAngle);
+                    double extraTwtt = (TargetDepthOffset * 2.0) / (liveSoundVelocity * cosAngle);
                     float modifiedTwtt = twtt + (float)extraTwtt;
 
                     // Qinsy High-Precision Fallback: Scale the sub-sample index proportionally

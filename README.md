@@ -27,4 +27,4 @@ dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=
 //
 File will be found in bin\Release\net8.0\win-x64\publish\
 //
-10. Use "./ShazrinSonar.exe --provision ShafiqNazrinSonar2026" in command prompt for license key
+10. Use ".\ShazrinSonar.exe --provision ShafiqNazrinSonar2026" in command prompt of working folder for license key

@@ -4,7 +4,6 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -19,7 +18,7 @@ namespace ShazrinSonar
         private static readonly string ConfigPath = "ShazrinSonar_Config.json";
         private static readonly string DebugLogPath = "s7k_debug.log";
 
-        // HIGH PRIORITY FIX: Use ConfigManager for thread-safe config access and live reloads
+        // Thread-safe config access and live reloads
         private static readonly ConfigManager _configManager = new ConfigManager(ConfigPath);
         private static AppSettings Config => _configManager.Current;
 
@@ -35,6 +34,10 @@ namespace ShazrinSonar
 
         private static readonly ConcurrentQueue<string> DiagnosticLogs = new ConcurrentQueue<string>();
 
+        // System Health Counters (Atomic)
+        private static long _qinsyConnectionDrops = 0;
+        private static long _invalidFramesDropped = 0;
+
         // Telemetry Counters
         private static long _totalBytesRead = 0;
         private static long _s7kFramesExtracted = 0;
@@ -42,7 +45,7 @@ namespace ShazrinSonar
         private static long _positionFrames = 0;
         private static long _otherRecordFrames = 0;
 
-        // Active Record 7027 Telemetry
+        // Active Record 7027 Telemetry (Atomic primitives)
         private static uint _lastPingNumber = 0;
         private static uint _lastBeamCount = 0;
 
@@ -77,7 +80,6 @@ namespace ShazrinSonar
         static async Task Main(string[] args)
         {
             // Developer-Only Provisioning Backdoor
-            // Run via terminal: ShazrinSonar.exe --provision ShafiqNazrinSonar2026
             if (args.Length == 2 && args[0] == "--provision" && args[1] == "ShafiqNazrinSonar2026")
             {
                 string hwid = SecurityManager.GenerateHardwareId();
@@ -101,7 +103,7 @@ namespace ShazrinSonar
                 Console.WriteLine("\nPlease check the 'Your_Hardware_ID.txt' file and send this Fingerprint to your administrator.");
                 Console.WriteLine("Press [ENTER] to exit...");
                 Console.ResetColor();
-                Console.ReadLine(); // Halts execution so the window stays open for the user to read
+                Console.ReadLine(); 
                 return;
             }
 
@@ -134,6 +136,12 @@ namespace ShazrinSonar
 
         private static void LogDiagnostic(string message)
         {
+            // Health Metric Interception: Track TCP drops without logging to disk
+            if (message.Contains("Client session ended") || message.Contains("forcibly closed") || message.Contains("Socket exception"))
+            {
+                Interlocked.Increment(ref _qinsyConnectionDrops);
+            }
+
             string entry = $"[{DateTime.Now:HH:mm:ss}] {message}";
             DiagnosticLogs.Enqueue(entry);
             while (DiagnosticLogs.Count > 6)
@@ -152,38 +160,38 @@ namespace ShazrinSonar
 
         private static void LoadConfiguration()
         {
-            var cfg = Config;
-            ApplyConfigUpdate(cfg);
+            ApplyConfigUpdate(Config);
 
             // Re-attach the live reload event to ensure Geofence & Offsets 
             // update immediately when the user saves ShazrinSonar_Config.json
             _configManager.OnConfigReloaded += (newConfig) =>
             {
                 ApplyConfigUpdate(newConfig);
-                LogDiagnostic($"[CONFIG] Live Reload: Offset={newConfig.TargetDepthOffset}m, Polygon Points={newConfig.GeofencePolygon.Count}");
+                LogDiagnostic($"[CONFIG] Live Reload: Offset={newConfig.TargetDepthOffset}m, Polygon Points={newConfig.GeofencePolygon?.Count ?? 0}");
             };
         }
 
         private static void ApplyConfigUpdate(AppSettings cfg)
         {
-            S7KFrameProcessor.Settings = new HydrographicConfig
-            {
-                TargetDepthOffset = cfg.TargetDepthOffset
-            };
+            // Inject the root TargetDepthOffset directly into the processor
+            S7KFrameProcessor.TargetDepthOffset = cfg.TargetDepthOffset;
 
+            // Pass the JSON coordinate array directly (GeofenceManager handles tuple mapping internally)
             if (cfg.GeofencePolygon != null)
             {
-                var polygonTuples = new (double Lat, double Lon)[cfg.GeofencePolygon.Count];
-                for (int i = 0; i < cfg.GeofencePolygon.Count; i++)
-                {
-                    polygonTuples[i] = (cfg.GeofencePolygon[i].Lat, cfg.GeofencePolygon[i].Lon);
-                }
-                GeofenceManager.SetPolygon(polygonTuples);
+                GeofenceManager.SetPolygon(cfg.GeofencePolygon);
             }
         }
 
         private static void HandleFrameTelemetry(int bytesRead, ushort recType, byte[] frame)
         {
+            // Safety check for null or empty frames dropping from the accumulator
+            if (frame == null || frame.Length == 0)
+            {
+                Interlocked.Increment(ref _invalidFramesDropped);
+                return;
+            }
+
             Interlocked.Add(ref _totalBytesRead, bytesRead);
             Interlocked.Increment(ref _s7kFramesExtracted);
 
@@ -195,7 +203,8 @@ namespace ShazrinSonar
             else if (recType == 1012 || recType == 1013 || recType == 1015 || recType == 1016 || frame.Length == 260)
             {
                 Interlocked.Increment(ref _positionFrames);
-                // Route Position data to the GPS extractor
+                
+                // Route Position data to the GPS extractor for live Geofence evaluations
                 if (recType == 1013)
                 {
                     S7KFrameProcessor.ProcessRecord1003(frame);
@@ -207,30 +216,14 @@ namespace ShazrinSonar
             }
         }
 
-        // private static void UnpackRecord7027Data(byte[] frame)
-        // {
-        //     if (frame.Length < 96) return;
-
-        //     try
-        //     {
-        //         uint pingNumber = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(64, 4));
-        //         uint beamCount = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(72, 4));
-
-        //         if (beamCount == 0 || beamCount > 2048)
-        //         {
-        //             beamCount = BinaryPrimitives.ReadUInt16LittleEndian(frame.AsSpan(72, 2));
-        //         }
-
-        //         if (pingNumber > 0) _lastPingNumber = pingNumber;
-        //         if (beamCount > 0 && beamCount <= 2048) _lastBeamCount = beamCount;
-        //     }
-        //     catch { }
-        // }
-
         private static void UnpackRecord7027Data(byte[] frame)
         {
             // 36 (Wrapper) + 64 (S7K Header) + 32 (Min Data) = 132 bytes
-            if (frame.Length < 132) return;
+            if (frame.Length < 132)
+            {
+                Interlocked.Increment(ref _invalidFramesDropped);
+                return;
+            }
 
             try
             {
@@ -254,11 +247,19 @@ namespace ShazrinSonar
 
                 while (!ct.IsCancellationRequested)
                 {
+                    // Fetch live coordinates from the manager
+                    var (currentLat, currentLon) = GeofenceManager.GetCurrentPosition();
+
                     double mbIngested = Interlocked.Read(ref _totalBytesRead) / 1024.0 / 1024.0;
-                    long totalFrames = Interlocked.Read(ref _s7kFramesExtracted);
                     long bathyFrames = Interlocked.Read(ref _bathymetryFrames);
                     long navFrames = Interlocked.Read(ref _positionFrames);
                     long miscFrames = Interlocked.Read(ref _otherRecordFrames);
+
+                    // Thread-safe reads for atomic UI telemetry primitives
+                    uint currentPing = Interlocked.CompareExchange(ref _lastPingNumber, 0, 0);
+                    uint currentBeams = Interlocked.CompareExchange(ref _lastBeamCount, 0, 0);
+                    long connectionDrops = Interlocked.Read(ref _qinsyConnectionDrops);
+                    long frameDrops = Interlocked.Read(ref _invalidFramesDropped);
 
                     var sb = new StringBuilder();
                     sb.Append("\x1b[H\x1b[J");
@@ -270,18 +271,19 @@ namespace ShazrinSonar
                     sb.AppendLine($"[+] Source (Norbit Client): {Config.SourceIp}:{Config.SourcePort}");
                     sb.AppendLine($"[+] Target (Qinsy Server) : Port {Config.TargetPort} ({Config.TargetProtocol})");
                     sb.AppendLine("--------------------------------------------------");
-                    sb.AppendLine("[+] HYDROGRAPHIC CONFIGURATION");
-                    sb.AppendLine($"    ├── Target Depth Offset: {S7KFrameProcessor.Settings.TargetDepthOffset:+0.00;-0.00;0.00} m");
-                    sb.AppendLine($"    └── Geofence Status    : {(GeofenceManager.IsInsideTargetZone() ? "INSIDE (Spoofing Active)" : "OUTSIDE")}");
+                    sb.AppendLine("[+] GEOFENCE & SPOOFING CONFIGURATION");
+                    sb.AppendLine($"    ├── Live Vessel GPS    : {currentLat:F6}, {currentLon:F6}");
+                    sb.AppendLine($"    ├── Geofence Status    : {(GeofenceManager.IsInsideTargetZone() ? "INSIDE (Spoofing Active)" : "OUTSIDE")}");
+                    sb.AppendLine($"    └── Target Depth Offset: {S7KFrameProcessor.TargetDepthOffset:+0.00;-0.00;0.00} m");
                     sb.AppendLine("--------------------------------------------------");
                     sb.AppendLine($"[+] STREAM METRICS");
-                    sb.AppendLine($"    ├── Raw Ingested Data : {mbIngested:F2} MB");
-                    sb.AppendLine($"    ├── S7K Records Total : {totalFrames:N0}");
-                    sb.AppendLine($"    │   ├── Bathymetry(7027) : {bathyFrames:N0}");
-                    sb.AppendLine($"    │   ├── Navigation(1012) : {navFrames:N0}");
-                    sb.AppendLine($"    │   └── System / Misc    : {miscFrames:N0}");
-                    sb.AppendLine($"    ├── Active Ping #     : {_lastPingNumber:N0}");
-                    sb.AppendLine($"    └── Beams Per Ping    : {(_lastBeamCount > 0 ? _lastBeamCount.ToString() : "64")}");
+                    sb.AppendLine($"    ├── S7K Records Parsed : Bathy: {bathyFrames:N0} | Nav: {navFrames:N0} | Misc: {miscFrames:N0}");
+                    sb.AppendLine($"    ├── Active Ping Number : {currentPing:N0}");
+                    sb.AppendLine($"    └── Beams Per Ping     : {(currentBeams > 0 ? currentBeams.ToString() : "Waiting...")}");
+                    sb.AppendLine("--------------------------------------------------");
+                    sb.AppendLine($"[+] SYSTEM HEALTH");
+                    sb.AppendLine($"    ├── Qinsy TCP Resets   : {connectionDrops:N0}");
+                    sb.AppendLine($"    └── Dropped Bad Frames : {frameDrops:N0}");
                     sb.AppendLine("--------------------------------------------------");
                     sb.AppendLine("[DIAGNOSTIC LOGS]");
 

@@ -20,55 +20,14 @@ namespace ShazrinSonar.Config
         public string TargetProtocol { get; set; } = "TCP";
         public int TargetPort { get; set; } = 7001;
 
-        // Hydrographic Offsets & Filtering
-        public double SoundVelocity { get; set; } = 1500.0;
-        public double TransducerDraft { get; set; } = 0.85;
-        public double WaterLevelOffset { get; set; } = -0.15;
-        public double GpsOffsetX { get; set; } = 0.20;        // GPS to Transducer Starboard/Port offset (m)
-        public double GpsOffsetY { get; set; } = 1.50;        // GPS to Transducer Bow/Stern offset (m)
-        public bool FilterLowQualityBeams { get; set; } = true;
-        public ushort MinQualityFlag { get; set; } = 0x01;
-
-        // Targeted Depth Manipulation
-        // Positive values push the seafloor deeper; Negative values pull the seafloor shallower.
-        public double TargetDepthOffset { get; set; } = 0.0;
-
-        // Dynamic Geofence Polygon
-        // Allows users to define 3+ points to create an active spoofing zone.
-        public List<GeoCoordinate> GeofencePolygon { get; set; } = new List<GeoCoordinate>();
-
         // Security Settings
         public string AuthorizedLicenseKey { get; set; } = "SHAZRIN-HWID-DEMO-KEY";
 
-        // Converts AppSettings to HydrographicConfig for S7KFrameProcessor
-        public HydrographicConfig ToHydrographicConfig()
-        {
-            return new HydrographicConfig
-            {
-                SoundVelocity = SoundVelocity,
-                TransducerDraft = TransducerDraft,
-                WaterLevelOffset = WaterLevelOffset,
-                GpsOffsetX = GpsOffsetX,
-                GpsOffsetY = GpsOffsetY,
-                FilterLowQualityBeams = FilterLowQualityBeams,
-                MinQualityFlag = MinQualityFlag,
-                TargetDepthOffset = TargetDepthOffset // Pass the new variable
-            };
-        }
-    }
-
-    public class HydrographicConfig
-    {
-        public double SoundVelocity { get; set; } = 1500.0;     // m/s
-        public double TransducerDraft { get; set; } = 0.85;     // Meters below surface
-        public double WaterLevelOffset { get; set; } = -0.15;   // Tide / Datum correction (m)
-        public double GpsOffsetX { get; set; } = 0.20;         // GPS to Transducer Starboard/Port offset (m)
-        public double GpsOffsetY { get; set; } = 1.50;         // GPS to Transducer Bow/Stern offset (m)
-        public bool FilterLowQualityBeams { get; set; } = true;
-        public ushort MinQualityFlag { get; set; } = 0x01;     // Bit 0 = Valid Detection
-
-        // Carried over to the processing engine
+        // Targeted Depth Manipulation
         public double TargetDepthOffset { get; set; } = 0.0;
+
+        // Dynamic Geofence Polygon
+        public List<GeoCoordinate> GeofencePolygon { get; set; } = new List<GeoCoordinate>();
     }
 
     public class ConfigManager : IDisposable
@@ -77,6 +36,7 @@ namespace ShazrinSonar.Config
         private AppSettings _currentSettings;
         private readonly object _lock = new object();
         private readonly FileSystemWatcher? _watcher;
+        private DateTime _lastRead = DateTime.MinValue; 
 
         private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
         {
@@ -111,10 +71,7 @@ namespace ShazrinSonar.Config
                     _watcher.Renamed += OnFileChanged;
                 }
             }
-            catch
-            {
-                // Fallback gracefully if filesystem watching is restricted
-            }
+            catch { }
         }
 
         public AppSettings Current
@@ -130,11 +87,11 @@ namespace ShazrinSonar.Config
 
         private void OnFileChanged(object sender, FileSystemEventArgs e)
         {
-            // Pause briefly to allow external file write locks to release
-            Thread.Sleep(150);
+            if ((DateTime.Now - _lastRead).TotalMilliseconds < 500) return;
 
             if (TryReload(out AppSettings updatedSettings))
             {
+                _lastRead = DateTime.Now;
                 OnConfigReloaded?.Invoke(updatedSettings);
             }
         }
@@ -155,15 +112,10 @@ namespace ShazrinSonar.Config
                 }
                 catch (IOException)
                 {
-                    // Delay retry for active editor write locks
-                    Thread.Sleep(100);
+                    Thread.Sleep(100); 
                 }
-                catch
-                {
-                    break;
-                }
+                catch { break; }
             }
-
             updatedSettings = Current;
             return false;
         }

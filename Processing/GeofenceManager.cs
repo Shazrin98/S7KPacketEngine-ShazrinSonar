@@ -19,11 +19,14 @@ namespace ShazrinSonar.Processing
         /// Updates the polygon vertices dynamically. 
         /// Thread-safe to prevent race conditions with incoming ping processing.
         /// </summary>
-        public static void SetPolygon(IEnumerable<(double Lat, double Lon)> vertices)
+        public static void SetPolygon(IEnumerable<Config.GeoCoordinate> vertices)
         {
+            if (vertices == null) return;
+
             lock (_lock)
             {
-                _polygon = vertices.ToArray();
+                // Map the GeoCoordinate objects from the JSON config into the (double, double) tuples the math engine uses
+                _polygon = vertices.Select(v => (v.Lat, v.Lon)).ToArray();
             }
         }
 
